@@ -12,6 +12,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
+#include <stdint.h>
 
 #define MAXDEPTH 256
 
@@ -138,6 +139,46 @@ static int hex4(P *p, size_t at, unsigned *out)
 	return 1;
 }
 
+/*
+ * Validate one UTF-8 sequence at s[0..n). Returns its length, or 0 if the
+ * sequence is malformed: bad continuation byte, overlong encoding,
+ * surrogate half, or a code point above U+10FFFF. RFC 8259 s8.1 requires
+ * JSON text to be UTF-8, so anything else is rejected rather than passed
+ * through -- otherwise this tool would emit invalid JSON.
+ */
+static size_t utf8_check(const char *s, size_t n)
+{
+	unsigned char a = (unsigned char)s[0], b, c, d;
+
+	if (a < 0x80)
+		return 1;
+	if (a < 0xC2 || a > 0xF4)		/* C0/C1 overlong, >F4 too big */
+		return 0;
+
+	b = n > 1 ? (unsigned char)s[1] : 0;
+	if (b < 0x80 || b > 0xBF)
+		return 0;
+
+	if (a < 0xE0)
+		return 2;
+
+	if (a < 0xF0) {				/* 3 bytes */
+		if (a == 0xE0 && b < 0xA0) return 0;	/* overlong */
+		if (a == 0xED && b > 0x9F) return 0;	/* surrogate */
+		c = n > 2 ? (unsigned char)s[2] : 0;
+		if (c < 0x80 || c > 0xBF) return 0;
+		return 3;
+	}
+
+	if (a == 0xF0 && b < 0x90) return 0;		/* overlong */
+	if (a == 0xF4 && b > 0x8F) return 0;		/* > U+10FFFF */
+	c = n > 2 ? (unsigned char)s[2] : 0;
+	d = n > 3 ? (unsigned char)s[3] : 0;
+	if (c < 0x80 || c > 0xBF) return 0;
+	if (d < 0x80 || d > 0xBF) return 0;
+	return 4;
+}
+
 static size_t utf8_put(char *d, unsigned cp)
 {
 	if (cp < 0x80) {
@@ -179,6 +220,12 @@ static jstr parse_string(P *p)
 			break;
 		if (c == '\\') { end += 2; continue; }
 		if (c < 0x20) { p->i = end; perr(p, "control character in string"); }
+		if (c >= 0x80) {
+			size_t w = utf8_check(p->s + end, p->n - end);
+			if (w == 0) { p->i = end; perr(p, "invalid UTF-8 in string"); }
+			end += w;
+			continue;
+		}
 		end++;
 	}
 	if (end >= p->n) { p->i = start; perr(p, "unterminated string"); }
@@ -334,7 +381,20 @@ static jval *parse_value(P *p)
 	case 'f': lit(p, "false"); v = newval(J_FALSE); break;
 	case 'n': lit(p, "null");  v = newval(J_NULL);  break;
 	case -1:  perr(p, "unexpected end of input"); return NULL;
-	default:  v = parse_number(p); break;
+	default:
+		if (peek(p) == '-' || isdig(peek(p))) {
+			v = parse_number(p);
+			break;
+		}
+		{
+			int c = peek(p);
+			if (c >= 0x20 && c < 0x7f)
+				die("parse error at byte %zu: unexpected '%c', "
+				    "input is not JSON", p->i, c);
+			die("parse error at byte %zu: unexpected byte 0x%02x, "
+			    "input is not JSON", p->i, (unsigned)c);
+		}
+		return NULL;
 	}
 	p->depth--;
 	return v;
@@ -346,32 +406,51 @@ static void print_str(const jstr *s)
 {
 	size_t i;
 
+	size_t run = 0;			/* pending bytes needing no escape */
+
 	fputc('"', stdout);
 	for (i = 0; i < s->len; i++) {
 		unsigned char c = (unsigned char)s->p[i];
+		const char *esc;
+		char ubuf[7];
+
 		switch (c) {
-		case '"':  fputs("\\\"", stdout); break;
-		case '\\': fputs("\\\\", stdout); break;
-		case '\b': fputs("\\b", stdout);  break;
-		case '\f': fputs("\\f", stdout);  break;
-		case '\n': fputs("\\n", stdout);  break;
-		case '\r': fputs("\\r", stdout);  break;
-		case '\t': fputs("\\t", stdout);  break;
+		case '"':  esc = "\\\""; break;
+		case '\\': esc = "\\\\"; break;
+		case '\b': esc = "\\b";  break;
+		case '\f': esc = "\\f";  break;
+		case '\n': esc = "\\n";  break;
+		case '\r': esc = "\\r";  break;
+		case '\t': esc = "\\t";  break;
 		default:
-			if (c < 0x20)
-				printf("\\u%04x", c);
-			else
-				fputc(c, stdout);
+			if (c >= 0x20) { run++; continue; }
+			sprintf(ubuf, "\\u%04x", c);
+			esc = ubuf;
 		}
+		if (run) {
+			fwrite(s->p + i - run, 1, run, stdout);
+			run = 0;
+		}
+		fputs(esc, stdout);
 	}
+	if (run)
+		fwrite(s->p + s->len - run, 1, run, stdout);
 	fputc('"', stdout);
 }
 
 static void pad(int lvl)
 {
-	int i;
-	for (i = 0; i < lvl; i++)
-		fputs("  ", stdout);
+	static char sp[64];
+	int n = lvl * 2;
+
+	if (sp[0] != ' ')
+		memset(sp, ' ', sizeof sp);
+	while (n > (int)sizeof sp) {
+		fwrite(sp, 1, sizeof sp, stdout);
+		n -= (int)sizeof sp;
+	}
+	if (n > 0)
+		fwrite(sp, 1, (size_t)n, stdout);
 }
 
 static void print_val(const jval *v, int lvl)
@@ -423,7 +502,7 @@ static const jval *select_path(const jval *v, const char *path)
 		const char *dot = strchr(q, '.');
 		size_t klen = dot ? (size_t)(dot - q) : strlen(q);
 
-		if (klen == 0)
+		if (klen == 0 || (dot && dot[1] == '\0'))
 			die("empty component in path '%s'", path);
 
 		if (v->t == J_OBJ) {
@@ -442,12 +521,17 @@ static const jval *select_path(const jval *v, const char *path)
 		} else if (v->t == J_ARR) {
 			size_t idx = 0, i;
 			for (i = 0; i < klen; i++) {
+				size_t d;
 				if (!isdig((unsigned char)q[i]))
 					die("cannot index array with '%.*s'", (int)klen, q);
-				idx = idx * 10 + (size_t)(q[i] - '0');
+				d = (size_t)(q[i] - '0');
+				if (idx > (SIZE_MAX - d) / 10)
+					die("index '%.*s' is too large", (int)klen, q);
+				idx = idx * 10 + d;
 			}
 			if (idx >= v->u.arr.n)
-				die("index %zu out of range (length %zu)", idx, v->u.arr.n);
+				die("index %zu out of range (total: %zu)",
+				    idx, v->u.arr.n);
 			v = v->u.arr.v[idx];
 		} else {
 			die("cannot index %s with '%.*s'", typename(v->t), (int)klen, q);
@@ -498,6 +582,7 @@ int main(int argc, char **argv)
 	if (argc > 2)
 		die("usage: %s [path]", progname);
 
+	setvbuf(stdout, NULL, _IOFBF, 1 << 16);
 	buf = slurp(stdin, &len);
 	p.s = buf; p.n = len; p.i = 0; p.depth = 0;
 
