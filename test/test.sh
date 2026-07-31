@@ -33,6 +33,28 @@ check() {
 	pass=$((pass + 1))
 }
 
+# checkf NAME INPUT WANT_RC WANT_OUT [ARGS...]  -- like check, but any
+# number of command-line arguments, so flags can be tested.
+checkf() {
+	name=$1 input=$2 want_rc=$3 want_out=$4
+	shift 4
+	got_out=$(printf '%s' "$input" | $JSON "$@" 2>/dev/null)
+	got_rc=$?
+	if [ "$got_rc" != "$want_rc" ]; then
+		printf 'FAIL %s: rc %s, want %s\n' "$name" "$got_rc" "$want_rc"
+		fail=$((fail + 1))
+		return
+	fi
+	if [ "$got_rc" = 0 ] && [ "$got_out" != "$want_out" ]; then
+		printf 'FAIL %s: output\n--- got ---\n%s\n--- want ---\n%s\n' \
+		    "$name" "$got_out" "$want_out"
+		fail=$((fail + 1))
+		return
+	fi
+	pass=$((pass + 1))
+}
+
+
 # --- scalars at top level (the JSON spec allows these) ---
 check num-int      '42'        '' 0 '42'
 check num-neg      '-1'        '' 0 '-1'
@@ -148,6 +170,46 @@ deep=$(python3 -c "print('['*($DEPTH+1) + ']'*($DEPTH+1))")
 check deep-reject "$deep" '' 1 ''
 ok=$(python3 -c "print('['*$DEPTH + ']'*$DEPTH)")
 check deep-accept "$ok" '' 0 "$(printf '%s' "$ok" | $JSON)"
+
+# --- slices: Python semantics (clamped, negative indices, steps) ---
+A='{"a":[10,20,30,40,50],"s":"hi\tthere","n":42,"o":{"x":["deep"]}}'
+check slice-basic   "$A" 'a[1:3]'   0 "$(printf '[\n  20,\n  30\n]')"
+check slice-clamp   "$A" 'a[0:99]'  0 "$(printf '[\n  10,\n  20,\n  30,\n  40,\n  50\n]')"
+check slice-neg     "$A" 'a[-2:]'   0 "$(printf '[\n  40,\n  50\n]')"
+check slice-open    "$A" 'a[:2]'    0 "$(printf '[\n  10,\n  20\n]')"
+check slice-step    "$A" 'a[::2]'   0 "$(printf '[\n  10,\n  30,\n  50\n]')"
+check slice-rev     "$A" 'a[::-1]'  0 "$(printf '[\n  50,\n  40,\n  30,\n  20,\n  10\n]')"
+check slice-empty   "$A" 'a[3:1]'   0 '[]'
+check slice-all     "$A" 'a[:]'     0 "$(printf '[\n  10,\n  20,\n  30,\n  40,\n  50\n]')"
+check slice-zerostep "$A" 'a[1:2:0]' 1 ''
+check slice-on-str  "$A" 's[0:1]'   1 ''
+
+# --- bracket indexing, including negative ---
+check br-index      "$A" 'a[0]'     0 '10'
+check br-negative   "$A" 'a[-1]'    0 '50'
+check br-oob        "$A" 'a[9]'     1 ''
+check br-neg-oob    "$A" 'a[-99]'   1 ''
+check br-empty      "$A" 'a[]'      1 ''
+check br-malformed  "$A" 'a[1:'     1 ''
+check br-mixed      "$A" 'a[1:3].0' 0 '20'
+check br-after-key  "$A" 'o.x[0]'   0 '"deep"'
+
+# --- -r / --raw-output ---
+checkf raw-short    "$A" 0 "$(printf 'hi\tthere')" -r s
+checkf raw-long     "$A" 0 "$(printf 'hi\tthere')" --raw-output s
+checkf raw-alias    "$A" 0 "$(printf 'hi\tthere')" --raw s
+checkf raw-quoted   "$A" 0 '"hi\tthere"'           s
+checkf raw-number   "$A" 0 '42'                    -r n
+checkf raw-nested   "$A" 0 'deep'                  -r o.x[0]
+checkf raw-toplevel '"bare"' 0 'bare'              -r
+checkf raw-noop     '{"k":1}' 0 "$(printf '{\n  "k": 1\n}')" -r
+
+# --- option handling ---
+checkf opt-rfc-stub "$A" 1 '' --rfc9535
+checkf opt-unknown  "$A" 1 '' --nope
+checkf opt-unknown2 "$A" 1 '' -x
+checkf opt-two-paths "$A" 1 '' a n
+
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

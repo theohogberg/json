@@ -21,12 +21,16 @@
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
+#include <limits.h>
 
 #ifndef MAXDEPTH				/* override with -DMAXDEPTH=N */
 #define MAXDEPTH 1024
 #endif
 
 static const char *progname = "json";
+
+static int opt_raw;			/* -r: print strings without quotes */
+static int opt_rfc;			/* --rfc9535: full JSONPath semantics */
 
 static void die(const char *fmt, ...)
 {
@@ -168,6 +172,16 @@ static const char *typename(jtype t)
 	case J_OBJ:   return "object";
 	}
 	return "?";
+}
+
+static void arr_push(jval *a, jval *item)
+{
+	if (a->u.arr.n == a->u.arr.cap) {
+		a->u.arr.cap = a->u.arr.cap ? a->u.arr.cap * 2 : 8;
+		a->u.arr.v = xrealloc(a->u.arr.v,
+				      a->u.arr.cap * sizeof *a->u.arr.v);
+	}
+	a->u.arr.v[a->u.arr.n++] = item;
 }
 
 /* ---------- parser ---------- */
@@ -937,7 +951,133 @@ static void print_sink(const jval *v, void *ctx)
 
 	if (c->n++)
 		oc('\n');
-	print_val(v, 0);
+	/*
+	 * -r prints a string result as its bytes, with no quotes and no
+	 * escaping, so it can feed a shell pipeline. It applies only when
+	 * the result itself is a string; strings nested inside a printed
+	 * object or array are still valid JSON and stay quoted.
+	 */
+	if (opt_raw && v->t == J_STR)
+		om(v->u.str.p, v->u.str.len);
+	else
+		print_val(v, 0);
+}
+
+/*
+ * Array slice, Python semantics -- which RFC 9535 adopted, so the two
+ * agree here. Negative indices count from the end, out-of-range bounds
+ * are clamped rather than rejected, and a zero step is an error.
+ *
+ * The result is a new array rather than a stream of elements, matching
+ * Python and jq. RFC 9535 would instead yield each element as its own
+ * result; that difference is reserved for --rfc9535.
+ */
+typedef struct {
+	long start, end, step;
+	int has_start, has_end, has_step;
+} jslice;
+
+/* Parse an optional signed integer. Returns 1 if one was present. */
+static int slice_num(const char **pp, long *out)
+{
+	const char *s = *pp;
+	long v = 0;
+	int neg = 0;
+
+	if (*s == '-') { neg = 1; s++; }
+	if (!isdig((unsigned char)*s))
+		return 0;
+	while (isdig((unsigned char)*s)) {
+		long d = *s - '0';
+		if (v > (LONG_MAX - d) / 10)
+			die("number too large in path");
+		v = v * 10 + d;
+		s++;
+	}
+	*pp = s;
+	*out = neg ? -v : v;
+	return 1;
+}
+
+static jval *slice_array(const jval *a, const jslice *sl)
+{
+	long n = (long)a->u.arr.n;
+	long step = sl->has_step ? sl->step : 1;
+	long start, end, i;
+	jval *out;
+
+	if (step == 0)
+		die("slice step cannot be zero");
+
+	/* defaults differ by direction: a[::-1] runs from the end down */
+	start = sl->has_start ? sl->start : (step > 0 ? 0 : n - 1);
+	end   = sl->has_end   ? sl->end   : (step > 0 ? n : -1);
+
+	if (sl->has_start && start < 0) start += n;
+	if (sl->has_end   && end   < 0) end   += n;
+
+	if (step > 0) {				/* valid positions are [0, n] */
+		if (start < 0) start = 0;
+		if (start > n) start = n;
+		if (end < 0) end = 0;
+		if (end > n) end = n;
+	} else {				/* and [-1, n-1] going down */
+		if (start < -1) start = -1;
+		if (start > n - 1) start = n - 1;
+		if (end < -1) end = -1;
+		if (end > n - 1) end = n - 1;
+	}
+
+	out = newval(J_ARR);
+	if (step > 0)
+		for (i = start; i < end; i += step)
+			arr_push(out, a->u.arr.v[i]);
+	else
+		for (i = start; i > end; i += step)
+			arr_push(out, a->u.arr.v[i]);
+	return out;
+}
+
+/* Apply a bracket component. *pp points just past '['; leaves it past ']'. */
+static const jval *apply_bracket(const jval *v, const char **pp, const char *path)
+{
+	const char *b = *pp;
+	jslice sl;
+	int is_slice = 0;
+
+	memset(&sl, 0, sizeof sl);
+	sl.has_start = slice_num(&b, &sl.start);
+	if (*b == ':') {
+		is_slice = 1;
+		b++;
+		sl.has_end = slice_num(&b, &sl.end);
+		if (*b == ':') {
+			b++;
+			sl.has_step = slice_num(&b, &sl.step);
+		}
+	}
+	if (*b != ']')
+		die("malformed bracket in path '%s'", path);
+	if (!is_slice && !sl.has_start)
+		die("empty bracket in path '%s'", path);
+	*pp = b + 1;
+
+	if (v->t != J_ARR)
+		die("cannot index %s with a bracket", typename(v->t));
+
+	if (is_slice)
+		return slice_array(v, &sl);
+
+	{					/* plain index, may be negative */
+		long idx = sl.start;
+
+		if (idx < 0)
+			idx += (long)v->u.arr.n;
+		if (idx < 0 || idx >= (long)v->u.arr.n)
+			die("index %ld out of range (total: %zu)",
+			    sl.start, v->u.arr.n);
+		return v->u.arr.v[idx];
+	}
 }
 
 static const jval *walk_path(const jval *v, const char *path)
@@ -947,44 +1087,58 @@ static const jval *walk_path(const jval *v, const char *path)
 	if (*q == '.')				/* allow both a.b and .a.b */
 		q++;
 	while (*q) {
-		const char *dot = strchr(q, '.');
-		size_t klen = dot ? (size_t)(dot - q) : strlen(q);
-
-		if (klen == 0 || (dot && dot[1] == '\0'))
-			die("empty component in path '%s'", path);
-
-		if (v->t == J_OBJ) {
-			const jval *next = NULL;
-			size_t i;
-			for (i = 0; i < v->u.obj.n; i++) {
-				if (v->u.obj.k[i].len == klen &&
-				    memcmp(v->u.obj.k[i].p, q, klen) == 0) {
-					next = v->u.obj.v[i];
-					break;
-				}
-			}
-			if (!next)
-				die("no such key: %.*s", (int)klen, q);
-			v = next;
-		} else if (v->t == J_ARR) {
-			size_t idx = 0, i;
-			for (i = 0; i < klen; i++) {
-				size_t d;
-				if (!isdig((unsigned char)q[i]))
-					die("cannot index array with '%.*s'", (int)klen, q);
-				d = (size_t)(q[i] - '0');
-				if (idx > (SIZE_MAX - d) / 10)
-					die("index '%.*s' is too large", (int)klen, q);
-				idx = idx * 10 + d;
-			}
-			if (idx >= v->u.arr.n)
-				die("index %zu out of range (total: %zu)",
-				    idx, v->u.arr.n);
-			v = v->u.arr.v[idx];
+		if (*q == '[') {
+			q++;
+			v = apply_bracket(v, &q, path);
 		} else {
-			die("cannot index %s with '%.*s'", typename(v->t), (int)klen, q);
+			size_t klen = 0;
+
+			while (q[klen] && q[klen] != '.' && q[klen] != '[')
+				klen++;
+			if (klen == 0)
+				die("empty component in path '%s'", path);
+
+			if (v->t == J_OBJ) {
+				const jval *next = NULL;
+				size_t i;
+				for (i = 0; i < v->u.obj.n; i++) {
+					if (v->u.obj.k[i].len == klen &&
+					    memcmp(v->u.obj.k[i].p, q, klen) == 0) {
+						next = v->u.obj.v[i];
+						break;
+					}
+				}
+				if (!next)
+					die("no such key: %.*s", (int)klen, q);
+				v = next;
+			} else if (v->t == J_ARR) {
+				size_t idx = 0, i;
+				for (i = 0; i < klen; i++) {
+					size_t d;
+					if (!isdig((unsigned char)q[i]))
+						die("cannot index array with '%.*s'",
+						    (int)klen, q);
+					d = (size_t)(q[i] - '0');
+					if (idx > (SIZE_MAX - d) / 10)
+						die("index '%.*s' is too large",
+						    (int)klen, q);
+					idx = idx * 10 + d;
+				}
+				if (idx >= v->u.arr.n)
+					die("index %zu out of range (total: %zu)",
+					    idx, v->u.arr.n);
+				v = v->u.arr.v[idx];
+			} else {
+				die("cannot index %s with '%.*s'",
+				    typename(v->t), (int)klen, q);
+			}
+			q += klen;
 		}
-		q = dot ? dot + 1 : q + klen;
+		if (*q == '.') {
+			q++;
+			if (*q == '\0' || *q == '.')
+				die("empty component in path '%s'", path);
+		}
 	}
 	return v;
 }
@@ -1050,6 +1204,26 @@ static char *slurp(FILE *f, size_t *outlen)
 	return buf;
 }
 
+static void usage(FILE *f)
+{
+	fprintf(f,
+"usage: %s [options] [path]\n"
+"\n"
+"Reads JSON on stdin and prints it formatted. With a path, prints the\n"
+"selected value instead.\n"
+"\n"
+"  path            user.name, items.0.id, items[2], items[1:3]\n"
+"                  slices follow Python rules: negative indices count\n"
+"                  from the end, out-of-range bounds are clamped, and\n"
+"                  the result is a sub-array\n"
+"\n"
+"  -r, --raw-output   print a string result without quotes or escapes\n"
+"      --raw          alias for --raw-output\n"
+"      --rfc9535      use RFC 9535 JSONPath semantics (not implemented)\n"
+"  -h, --help         this message\n"
+"  --                 end of options\n", progname);
+}
+
 int main(int argc, char **argv)
 {
 	char *buf;
@@ -1057,15 +1231,42 @@ int main(int argc, char **argv)
 	P p;
 	jval *root;
 	struct print_ctx out;
+	const char *filter = NULL;
+	int i, endopts = 0;
 
-	if (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
-		fprintf(stderr, "usage: %s [path]\n"
-		                "  reads JSON on stdin, prints it formatted\n"
-		                "  path selects a value: user.name, items.0.id\n", progname);
-		return 0;
+	for (i = 1; i < argc; i++) {
+		const char *a = argv[i];
+
+		if (endopts || a[0] != '-' || a[1] == '\0') {
+			if (filter)
+				die("only one path may be given");
+			filter = a;
+		} else if (a[1] == '-') {		/* long option */
+			const char *o = a + 2;
+			if (*o == '\0') { endopts = 1; continue; }
+			if (strcmp(o, "help") == 0) { usage(stdout); return 0; }
+			else if (strcmp(o, "raw-output") == 0 ||
+				 strcmp(o, "raw") == 0) opt_raw = 1;
+			else if (strcmp(o, "rfc9535") == 0) opt_rfc = 1;
+			else die("unknown option '%s' (try --help)", a);
+		} else {				/* short option cluster */
+			const char *o;
+			for (o = a + 1; *o; o++) {
+				switch (*o) {
+				case 'r': opt_raw = 1; break;
+				case 'h': usage(stdout); return 0;
+				default:
+					die("unknown option '-%c' (try --help)", *o);
+				}
+			}
+		}
 	}
-	if (argc > 2)
-		die("usage: %s [path]", progname);
+
+	if (opt_rfc)
+		die("--rfc9535 is not implemented yet: slices currently yield a\n"
+		    "sub-array (Python and jq behaviour) rather than one result\n"
+		    "per element, and a missing key is an error rather than an\n"
+		    "empty result");
 
 	setvbuf(stdout, NULL, _IOFBF, 1 << 16);
 	buf = slurp(stdin, &len);
@@ -1074,8 +1275,19 @@ int main(int argc, char **argv)
 	skipws(&p);
 	if (p.i == p.n)
 		die("empty input");
-	if (argc == 1) {			/* no path: stream, never build a tree */
-		emit_value(&p, 0);
+
+	if (!filter) {
+		/*
+		 * No path: stream, never build a tree. The one exception is
+		 * -r on a document that is itself a string, which has to be
+		 * decoded before it can be printed unquoted.
+		 */
+		if (opt_raw && peek(&p) == '"') {
+			jstr s = parse_string(&p);
+			om(s.p, s.len);
+		} else {
+			emit_value(&p, 0);
+		}
 		skipws(&p);
 		if (p.i != p.n)
 			perr(&p, "trailing data after JSON value");
@@ -1083,13 +1295,14 @@ int main(int argc, char **argv)
 		oflush();
 		return 0;
 	}
+
 	root = parse_value(&p);
 	skipws(&p);
 	if (p.i != p.n)
 		perr(&p, "trailing data after JSON value");
 
 	out.n = 0;
-	eval(root, argv[1], print_sink, &out);
+	eval(root, filter, print_sink, &out);
 	oc('\n');
 	oflush();
 	return 0;
