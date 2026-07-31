@@ -676,7 +676,7 @@ static const jval *select_path(const jval *v, const char *path)
 			}
 			if (idx >= v->u.arr.n)
 				die("index %zu out of range (total: %zu)",
-				    idx, v->u.arr.n);
+				    idx, v->u.arr.n-1);
 			v = v->u.arr.v[idx];
 		} else {
 			die("cannot index %s with '%.*s'", typename(v->t), (int)klen, q);
