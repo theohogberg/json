@@ -5,7 +5,7 @@
  *   curl -s URL | json user.name
  *   curl -s URL | json items.0.id
  *
- * build: cc -std=c99 -O2 -Wall -Wextra -o json json.c
+ * build: make
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,7 +14,9 @@
 #include <errno.h>
 #include <stdint.h>
 
-#define MAXDEPTH 256
+#ifndef MAXDEPTH				/* override with -DMAXDEPTH=N */
+#define MAXDEPTH 1024
+#endif
 
 static const char *progname = "json";
 
@@ -167,8 +169,8 @@ static int hex4(P *p, size_t at, unsigned *out)
 /*
  * Validate one UTF-8 sequence at s[0..n). Returns its length, or 0 if the
  * sequence is malformed: bad continuation byte, overlong encoding,
- * surrogate half, or a code point above U+10FFFF. RFC 8259 s8.1 requires
- * JSON text to be UTF-8, so anything else is rejected rather than passed
+ * surrogate half, or a code point above U+10FFFF. The JSON spec requires
+ * text to be UTF-8, so anything else is rejected rather than passed
  * through -- otherwise this tool would emit invalid JSON.
  */
 static size_t utf8_check(const char *s, size_t n)
