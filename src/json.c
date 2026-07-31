@@ -46,6 +46,31 @@ static void *xrealloc(void *p, size_t n)
 	return q;
 }
 
+
+/* ---------- arena ----------
+ * The tool never frees, so per-value malloc buys nothing but overhead.
+ * Bump-allocate from big chunks instead; exit reclaims.
+ */
+#define ARENA_CHUNK (1u << 20)
+static char  *arena_ptr;
+static size_t arena_left;
+
+static void *arena_alloc(size_t n)
+{
+	void *p;
+
+	n = (n + 15) & ~(size_t)15;		/* keep 16-byte alignment */
+	if (n > arena_left) {
+		size_t sz = n > ARENA_CHUNK ? n : ARENA_CHUNK;
+		arena_ptr = xmalloc(sz);
+		arena_left = sz;
+	}
+	p = arena_ptr;
+	arena_ptr += n;
+	arena_left -= n;
+	return p;
+}
+
 static int isdig(int c) { return c >= '0' && c <= '9'; }
 
 /* ---------- value model ---------- */
@@ -113,7 +138,7 @@ static void skipws(P *p)
 
 static jval *newval(jtype t)
 {
-	jval *v = xmalloc(sizeof *v);
+	jval *v = arena_alloc(sizeof *v);
 	memset(v, 0, sizeof *v);
 	v->t = t;
 	return v;
@@ -230,7 +255,7 @@ static jstr parse_string(P *p)
 	}
 	if (end >= p->n) { p->i = start; perr(p, "unterminated string"); }
 
-	out.p = xmalloc(end - start + 1);
+	out.p = arena_alloc(end - start + 1);
 	o = 0;
 	for (j = start; j < end; ) {
 		unsigned char c = (unsigned char)p->s[j];
@@ -402,13 +427,51 @@ static jval *parse_value(P *p)
 
 /* ---------- printer ---------- */
 
+
+/* ---------- output buffer ----------
+ * stdio costs a call (and a lock) per token. Batch into one buffer and
+ * hand it to the kernel in big writes.
+ */
+static char   obuf[1u << 16];
+static size_t olen;
+
+static void oflush(void)
+{
+	if (olen && fwrite(obuf, 1, olen, stdout) != olen)
+		die("write error: %s", strerror(errno));
+	olen = 0;
+}
+
+static void om(const char *s, size_t n)
+{
+	if (n >= sizeof obuf) {
+		oflush();
+		if (fwrite(s, 1, n, stdout) != n)
+			die("write error: %s", strerror(errno));
+		return;
+	}
+	if (olen + n > sizeof obuf)
+		oflush();
+	memcpy(obuf + olen, s, n);
+	olen += n;
+}
+
+static void oc(char c)
+{
+	if (olen == sizeof obuf)
+		oflush();
+	obuf[olen++] = c;
+}
+
+static void os_(const char *s) { om(s, strlen(s)); }
+
 static void print_str(const jstr *s)
 {
 	size_t i;
 
 	size_t run = 0;			/* pending bytes needing no escape */
 
-	fputc('"', stdout);
+	oc('"');
 	for (i = 0; i < s->len; i++) {
 		unsigned char c = (unsigned char)s->p[i];
 		const char *esc;
@@ -428,14 +491,14 @@ static void print_str(const jstr *s)
 			esc = ubuf;
 		}
 		if (run) {
-			fwrite(s->p + i - run, 1, run, stdout);
+			om(s->p + i - run, run);
 			run = 0;
 		}
-		fputs(esc, stdout);
+		os_(esc);
 	}
 	if (run)
-		fwrite(s->p + s->len - run, 1, run, stdout);
-	fputc('"', stdout);
+		om(s->p + s->len - run, run);
+	oc('"');
 }
 
 static void pad(int lvl)
@@ -446,11 +509,11 @@ static void pad(int lvl)
 	if (sp[0] != ' ')
 		memset(sp, ' ', sizeof sp);
 	while (n > (int)sizeof sp) {
-		fwrite(sp, 1, sizeof sp, stdout);
+		om(sp, sizeof sp);
 		n -= (int)sizeof sp;
 	}
 	if (n > 0)
-		fwrite(sp, 1, (size_t)n, stdout);
+		om(sp, (size_t)n);
 }
 
 static void print_val(const jval *v, int lvl)
@@ -458,34 +521,34 @@ static void print_val(const jval *v, int lvl)
 	size_t i;
 
 	switch (v->t) {
-	case J_NULL:  fputs("null", stdout);  break;
-	case J_TRUE:  fputs("true", stdout);  break;
-	case J_FALSE: fputs("false", stdout); break;
-	case J_NUM:   fwrite(v->u.num.p, 1, v->u.num.len, stdout); break;
+	case J_NULL:  os_("null");  break;
+	case J_TRUE:  os_("true");  break;
+	case J_FALSE: os_("false"); break;
+	case J_NUM:   om(v->u.num.p, v->u.num.len); break;
 	case J_STR:   print_str(&v->u.str); break;
 	case J_ARR:
-		if (v->u.arr.n == 0) { fputs("[]", stdout); break; }
-		fputs("[\n", stdout);
+		if (v->u.arr.n == 0) { os_("[]"); break; }
+		os_("[\n");
 		for (i = 0; i < v->u.arr.n; i++) {
 			pad(lvl + 1);
 			print_val(v->u.arr.v[i], lvl + 1);
-			fputs(i + 1 < v->u.arr.n ? ",\n" : "\n", stdout);
+			os_(i + 1 < v->u.arr.n ? ",\n" : "\n");
 		}
 		pad(lvl);
-		fputc(']', stdout);
+		oc(']');
 		break;
 	case J_OBJ:
-		if (v->u.obj.n == 0) { fputs("{}", stdout); break; }
-		fputs("{\n", stdout);
+		if (v->u.obj.n == 0) { os_("{}"); break; }
+		os_("{\n");
 		for (i = 0; i < v->u.obj.n; i++) {
 			pad(lvl + 1);
 			print_str(&v->u.obj.k[i]);
-			fputs(": ", stdout);
+			os_(": ");
 			print_val(v->u.obj.v[i], lvl + 1);
-			fputs(i + 1 < v->u.obj.n ? ",\n" : "\n", stdout);
+			os_(i + 1 < v->u.obj.n ? ",\n" : "\n");
 		}
 		pad(lvl);
-		fputc('}', stdout);
+		oc('}');
 		break;
 	}
 }
@@ -596,6 +659,7 @@ int main(int argc, char **argv)
 
 	sel = (argc == 2) ? select_path(root, argv[1]) : root;
 	print_val(sel, 0);
-	fputc('\n', stdout);
+	oc('\n');
+	oflush();
 	return 0;
 }
