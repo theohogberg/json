@@ -20,7 +20,7 @@ N = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
 
 ATOMS = [
     None, True, False, 0, -1, 42, 3.5, -0.25, 1e10, 1e-10,
-    "", "plain", "a\"b", "a\\b", "tab\there", "nl\nhere",
+    "", "plain", "a\'\"b", "a\'b", "a\"b", "a\\b", "tab\there", "nl\nhere",
     "\u00e5\u00e4\u00f6", "\u4e2d\u6587", "\U0001f600", "\u0001\u001f",
     "  spaced  ", "0", "null",
 ]
