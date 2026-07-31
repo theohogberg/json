@@ -1,4 +1,6 @@
 .vimrc
 out/
 build/
+JSONTestSuite/
 .vs/
+tags

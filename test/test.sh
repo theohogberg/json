@@ -1,8 +1,8 @@
 #!/bin/sh
-# test.sh - regression tests for ./json
+# Regression tests. Set JSON to the binary under test and DEPTH to the
+# recursion cap it was built with.
 #
-#   ./test.sh            run against ./json
-#   JSON=./json.asan ./test.sh
+#   JSON=out/json test/test.sh
 #
 # exit 0 = all passed
 
@@ -33,7 +33,7 @@ check() {
 	pass=$((pass + 1))
 }
 
-# --- scalars at top level (RFC 8259 allows these) ---
+# --- scalars at top level (the JSON spec allows these) ---
 check num-int      '42'        '' 0 '42'
 check num-neg      '-1'        '' 0 '-1'
 check num-exp      '1e10'      '' 0 '1e10'
@@ -141,9 +141,12 @@ check ok-utf8-3byte   "$(printf '"\344\270\255"')"     '' 0 "$(printf '"\344\270
 check ok-utf8-4byte   "$(printf '"\360\237\230\200"')" '' 0 "$(printf '"\360\237\230\200"')"
 
 # --- depth limit, no stack smash ---
-deep=$(python3 -c 'print("["*300 + "]"*300)')
+# Derived from the configured cap rather than hard-coded, so the test
+# keeps checking the real boundary when the cap changes.
+DEPTH=${DEPTH:-1024}
+deep=$(python3 -c "print('['*($DEPTH+1) + ']'*($DEPTH+1))")
 check deep-reject "$deep" '' 1 ''
-ok=$(python3 -c 'print("["*200 + "]"*200)')
+ok=$(python3 -c "print('['*$DEPTH + ']'*$DEPTH)")
 check deep-accept "$ok" '' 0 "$(printf '%s' "$ok" | $JSON)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

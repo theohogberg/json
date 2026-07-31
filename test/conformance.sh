@@ -1,5 +1,5 @@
 #!/bin/sh
-# conformance.sh - run JSONTestSuite (github.com/nst/JSONTestSuite) against ./json
+# Run the JSON parsing conformance corpus against the binary in JSON.
 #
 #   y_*  must be accepted
 #   n_*  must be rejected
