@@ -232,6 +232,7 @@ static size_t utf8_put(char *d, unsigned cp)
 static jstr parse_string(P *p)
 {
 	size_t start, end, j, o;
+	int esc;
 	jstr out;
 
 	if (peek(p) != '"')
@@ -239,11 +240,12 @@ static jstr parse_string(P *p)
 	p->i++;
 	start = p->i;
 
+	esc = 0;
 	for (end = start; end < p->n; ) {
 		unsigned char c = (unsigned char)p->s[end];
 		if (c == '"')
 			break;
-		if (c == '\\') { end += 2; continue; }
+		if (c == '\\') { esc = 1; end += 2; continue; }
 		if (c < 0x20) { p->i = end; perr(p, "control character in string"); }
 		if (c >= 0x80) {
 			size_t w = utf8_check(p->s + end, p->n - end);
@@ -256,6 +258,18 @@ static jstr parse_string(P *p)
 	if (end >= p->n) { p->i = start; perr(p, "unterminated string"); }
 
 	out.p = arena_alloc(end - start + 1);
+	/*
+	 * The overwhelming majority of JSON strings contain no escapes.
+	 * When pass 1 saw none, the decode loop below would copy the span
+	 * one byte at a time for no reason -- memcpy it instead.
+	 */
+	if (!esc) {
+		memcpy(out.p, p->s + start, end - start);
+		out.p[end - start] = '\0';
+		out.len = end - start;
+		p->i = end + 1;
+		return out;
+	}
 	o = 0;
 	for (j = start; j < end; ) {
 		unsigned char c = (unsigned char)p->s[j];

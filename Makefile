@@ -30,23 +30,23 @@ $(ASAN): $(SRC) | $(OUT)
 
 # fast feedback loop
 test: $(BIN)
-	JSON=$(BIN) ./test.sh
+	JSON=$(BIN) ./test/test.sh
 
 # same tests, memory- and UB-checked
 check: $(ASAN) JSONTestSuite
-	$(SANENV) JSON=$(ASAN) ./test.sh
-	$(SANENV) JSON=$(ASAN) ./conformance.sh
+	$(SANENV) JSON=$(ASAN) ./test/test.sh
+	$(SANENV) JSON=$(ASAN) ./test/conformance.sh
 
 # differential test against a reference parser
 fuzz: $(ASAN)
-	$(SANENV) python3 fuzz.py 5000 $(ASAN)
+	$(SANENV) python3 test/fuzz.py 5000 $(ASAN)
 
 # github.com/nst/JSONTestSuite
 JSONTestSuite:
 	git clone --depth 1 https://github.com/nst/JSONTestSuite.git
 
 conformance: $(BIN) JSONTestSuite
-	JSON=$(BIN) ./conformance.sh
+	JSON=$(BIN) ./test/conformance.sh
 
 # everything, the way CI should run it
 ci: test check fuzz conformance
