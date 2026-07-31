@@ -17,7 +17,7 @@ BINS      = $(addprefix $(OUT)/,$(VARIANTS))
 ASANS     = $(addsuffix .asan,$(BINS))
 
 # which variant `make install` ships
-MAIN     ?= json_stream
+MAIN     ?= json
 
 SAN       = -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
 # the tool deliberately never frees; exit reclaims. turn off the leak

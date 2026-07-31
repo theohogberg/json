@@ -1,9 +1,17 @@
 /*
- * json - pretty-print JSON from stdin, optionally selecting a path
+ * json - format JSON from stdin, optionally selecting a value
  *
  *   curl -s URL | json
  *   curl -s URL | json user.name
  *   curl -s URL | json items.0.id
+ *
+ * Two execution paths. With no filter the document is validated and
+ * reformatted in a single pass with no allocation at all, because the
+ * tree would be built, printed once and thrown away. With a filter the
+ * document is parsed into a tree, since selecting needs random access.
+ *
+ * Results reach the output through a sink callback rather than a return
+ * value, so a filter can yield any number of values.
  *
  * build: make
  */
@@ -50,26 +58,79 @@ static void *xrealloc(void *p, size_t n)
 
 
 /* ---------- arena ----------
- * The tool never frees, so per-value malloc buys nothing but overhead.
- * Bump-allocate from big chunks instead; exit reclaims.
+ * Values and decoded strings are bump-allocated out of large chunks
+ * rather than malloc'd one at a time.
+ *
+ * Chunks are kept and reused rather than freed, so arena_restore() is
+ * O(1) and costs no allocator traffic. That is what makes per-element
+ * processing possible: parse one element, use it, restore the mark, and
+ * the next element reuses the same memory instead of growing a tree for
+ * the whole document.
  */
 #define ARENA_CHUNK (1u << 20)
-static char  *arena_ptr;
-static size_t arena_left;
+
+static char  **arena_chunk;			/* every chunk ever allocated */
+static size_t *arena_size;			/* its capacity */
+static size_t  arena_n, arena_cap;		/* chunks in use / array capacity */
+static size_t  arena_cur, arena_off;		/* current chunk and bump offset */
+
+typedef struct {
+	size_t chunk, off;
+} amark;
+
+static amark arena_save(void)
+{
+	amark m;
+
+	m.chunk = arena_cur;
+	m.off = arena_off;
+	return m;
+}
+
+/*
+ * Everything allocated since the mark becomes free for reuse. Any value
+ * that must outlive the mark has to be copied out first -- there is no
+ * way to detect a dangling reference, so keep the lifetime obvious.
+ */
+static void arena_restore(amark m)
+{
+	arena_cur = m.chunk;
+	arena_off = m.off;
+}
+
+static void arena_push(size_t want)
+{
+	size_t sz = want > ARENA_CHUNK ? want : ARENA_CHUNK;
+
+	if (arena_n == arena_cap) {
+		arena_cap = arena_cap ? arena_cap * 2 : 8;
+		arena_chunk = xrealloc(arena_chunk, arena_cap * sizeof *arena_chunk);
+		arena_size  = xrealloc(arena_size,  arena_cap * sizeof *arena_size);
+	}
+	arena_chunk[arena_n] = xmalloc(sz);
+	arena_size[arena_n] = sz;
+	arena_cur = arena_n;
+	arena_off = 0;
+	arena_n++;
+}
 
 static void *arena_alloc(size_t n)
 {
 	void *p;
 
 	n = (n + 15) & ~(size_t)15;		/* keep 16-byte alignment */
-	if (n > arena_left) {
-		size_t sz = n > ARENA_CHUNK ? n : ARENA_CHUNK;
-		arena_ptr = xmalloc(sz);
-		arena_left = sz;
+	for (;;) {
+		if (arena_n && arena_size[arena_cur] - arena_off >= n)
+			break;
+		if (arena_cur + 1 < arena_n) {	/* reuse an existing chunk */
+			arena_cur++;
+			arena_off = 0;
+			continue;
+		}
+		arena_push(n);
 	}
-	p = arena_ptr;
-	arena_ptr += n;
-	arena_left -= n;
+	p = arena_chunk[arena_cur] + arena_off;
+	arena_off += n;
 	return p;
 }
 
@@ -127,15 +188,83 @@ static int peek(P *p)
 	return p->i < p->n ? (unsigned char)p->s[p->i] : -1;
 }
 
-static void skipws(P *p)
+
+#if (defined(__SSE2__) || defined(_M_X64)) && !defined(NOSIMD)
+#include <emmintrin.h>
+#define HAVE_SIMD 1
+#endif
+
+/*
+ * First byte in s[0..n) that needs attention inside a string literal:
+ * a closing quote, a backslash, a control character, or a non-ASCII byte
+ * that must go through UTF-8 validation. Returns n if there is none.
+ * The SSE2 path checks 16 bytes per iteration; the scalar loop below is
+ * both the tail and the fallback on non-x86.
+ */
+static size_t scan_str(const char *s, size_t n)
 {
-	while (p->i < p->n) {
-		char c = p->s[p->i];
-		if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
-			p->i++;
-		else
+	size_t i = 0;
+#ifdef HAVE_SIMD
+	const __m128i q  = _mm_set1_epi8('"');
+	const __m128i bs = _mm_set1_epi8('\\');
+	const __m128i ctl = _mm_set1_epi8(0x1F);
+
+	for (; i + 16 <= n; i += 16) {
+		__m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+		__m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, q),
+					 _mm_cmpeq_epi8(v, bs));
+		int bits;
+
+		/* unsigned v <= 0x1F, via min: SSE2 has no unsigned compare */
+		m = _mm_or_si128(m, _mm_cmpeq_epi8(_mm_min_epu8(v, ctl), v));
+		/* v >= 0x80 is just the sign bit, so OR v in and take movemask */
+		bits = _mm_movemask_epi8(_mm_or_si128(m, v));
+		if (bits)
+			return i + (size_t)__builtin_ctz((unsigned)bits);
+	}
+#endif
+	for (; i < n; i++) {
+		unsigned char c = (unsigned char)s[i];
+		if (c == '"' || c == '\\' || c < 0x20 || c >= 0x80)
+			return i;
+	}
+	return n;
+}
+
+/* Length of the whitespace run at s[0..n). */
+static size_t scan_ws(const char *s, size_t n)
+{
+	size_t i = 0;
+#ifdef HAVE_SIMD
+	const __m128i sp = _mm_set1_epi8(' ');
+	const __m128i tb = _mm_set1_epi8('\t');
+	const __m128i nl = _mm_set1_epi8('\n');
+	const __m128i cr = _mm_set1_epi8('\r');
+
+	for (; i + 16 <= n; i += 16) {
+		__m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+		__m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, sp),
+					 _mm_cmpeq_epi8(v, tb));
+		int bits;
+
+		m = _mm_or_si128(m, _mm_cmpeq_epi8(v, nl));
+		m = _mm_or_si128(m, _mm_cmpeq_epi8(v, cr));
+		bits = _mm_movemask_epi8(m);
+		if (bits != 0xFFFF)
+			return i + (size_t)__builtin_ctz(~(unsigned)bits);
+	}
+#endif
+	for (; i < n; i++) {
+		char c = s[i];
+		if (c != ' ' && c != '\t' && c != '\n' && c != '\r')
 			break;
 	}
+	return i;
+}
+
+static void skipws(P *p)
+{
+	p->i += scan_ws(p->s + p->i, p->n - p->i);
 }
 
 static jval *newval(jtype t)
@@ -244,28 +373,26 @@ static jstr parse_string(P *p)
 
 	esc = 0;
 	for (end = start; end < p->n; ) {
-		unsigned char c = (unsigned char)p->s[end];
+		unsigned char c;
+
+		end += scan_str(p->s + end, p->n - end);
+		if (end >= p->n)
+			break;
+		c = (unsigned char)p->s[end];
 		if (c == '"')
 			break;
 		if (c == '\\') { esc = 1; end += 2; continue; }
 		if (c < 0x20) { p->i = end; perr(p, "control character in string"); }
-		if (c >= 0x80) {
+		{
 			size_t w = utf8_check(p->s + end, p->n - end);
 			if (w == 0) { p->i = end; perr(p, "invalid UTF-8 in string"); }
 			end += w;
-			continue;
 		}
-		end++;
 	}
 	if (end >= p->n) { p->i = start; perr(p, "unterminated string"); }
 
 	out.p = arena_alloc(end - start + 1);
-	/*
-	 * The overwhelming majority of JSON strings contain no escapes.
-	 * When pass 1 saw none, the decode loop below would copy the span
-	 * one byte at a time for no reason -- memcpy it instead.
-	 */
-	if (!esc) {
+	if (!esc) {				/* common case: nothing to decode */
 		memcpy(out.p, p->s + start, end - start);
 		out.p[end - start] = '\0';
 		out.len = end - start;
@@ -569,9 +696,251 @@ static void print_val(const jval *v, int lvl)
 	}
 }
 
+
+/* ---------- streaming reformatter ----------
+ * When no path is given, the document is printed once and discarded, so
+ * building a tree is wasted work: every value costs a node and every
+ * string costs a copy, all to be freed at exit. These functions validate
+ * and emit in a single pass with zero allocation. Strings are echoed as
+ * they appeared in the input rather than decoded and re-escaped, so
+ * \u0041 stays \u0041 instead of becoming A.
+ */
+static void emit_value(P *p, int lvl);
+
+static void emit_indent(int lvl)
+{
+	static char sp[64];
+	int n = lvl * 2;
+
+	if (sp[0] != ' ')
+		memset(sp, ' ', sizeof sp);
+	while (n > (int)sizeof sp) { om(sp, sizeof sp); n -= (int)sizeof sp; }
+	if (n > 0)
+		om(sp, (size_t)n);
+}
+
+/*
+ * Emit one decoded byte with the same escaping print_str would apply, so
+ * streamed output matches tree output byte for byte.
+ */
+static void emit_esc_byte(unsigned char c)
+{
+	char b[8];
+
+	switch (c) {
+	case '"':  os_("\\\""); return;
+	case '\\': os_("\\\\"); return;
+	case '\b': os_("\\b");  return;
+	case '\f': os_("\\f");  return;
+	case '\n': os_("\\n");  return;
+	case '\r': os_("\\r");  return;
+	case '\t': os_("\\t");  return;
+	default:
+		if (c < 0x20) { sprintf(b, "\\u%04x", c); os_(b); return; }
+		oc((char)c);
+	}
+}
+
+/*
+ * Validate the string at p->i and emit it. Unescaped runs go straight
+ * from the input buffer to the output buffer; escapes are decoded and
+ * re-emitted inline. Nothing is allocated.
+ */
+static void emit_string(P *p)
+{
+	size_t run;
+
+	if (peek(p) != '"')
+		perr(p, "expected string");
+	p->i++;
+	oc('"');
+	run = p->i;
+	for (;;) {
+		unsigned char c;
+
+		p->i += scan_str(p->s + p->i, p->n - p->i);
+		if (p->i >= p->n) { p->i = run; perr(p, "unterminated string"); }
+		c = (unsigned char)p->s[p->i];
+
+		if (c == '"') {
+			om(p->s + run, p->i - run);
+			p->i++;
+			oc('"');
+			return;
+		}
+		if (c < 0x20)
+			perr(p, "control character in string");
+		if (c != '\\') {			/* non-ASCII: validate, keep */
+			size_t w = utf8_check(p->s + p->i, p->n - p->i);
+			if (w == 0) perr(p, "invalid UTF-8 in string");
+			p->i += w;
+			continue;
+		}
+
+		om(p->s + run, p->i - run);	/* flush the pending clean run */
+		p->i++;
+		if (p->i >= p->n) perr(p, "truncated escape");
+		switch (p->s[p->i]) {
+		case '"':  p->i++; os_("\\\""); break;
+		case '\\': p->i++; os_("\\\\"); break;
+		case '/':  p->i++; oc('/');     break;
+		case 'b':  p->i++; os_("\\b");  break;
+		case 'f':  p->i++; os_("\\f");  break;
+		case 'n':  p->i++; os_("\\n");  break;
+		case 'r':  p->i++; os_("\\r");  break;
+		case 't':  p->i++; os_("\\t");  break;
+		case 'u': {
+			unsigned cp, lo;
+			char ubuf[4];
+
+			if (!hex4(p, p->i + 1, &cp)) perr(p, "bad \\u escape");
+			p->i += 5;
+			if (cp >= 0xD800 && cp <= 0xDBFF) {
+				if (p->i + 1 < p->n && p->s[p->i] == '\\' &&
+				    p->s[p->i + 1] == 'u' &&
+				    hex4(p, p->i + 2, &lo) &&
+				    lo >= 0xDC00 && lo <= 0xDFFF) {
+					cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+					p->i += 6;
+				} else {
+					cp = 0xFFFD;
+				}
+			} else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+				cp = 0xFFFD;
+			}
+			if (cp < 0x80)
+				emit_esc_byte((unsigned char)cp);
+			else
+				om(ubuf, utf8_put(ubuf, cp));
+			break;
+		}
+		default:
+			perr(p, "unknown escape");
+		}
+		run = p->i;
+	}
+}
+
+static void emit_number(P *p)
+{
+	size_t start = p->i;
+
+	if (peek(p) == '-') p->i++;
+	if (peek(p) == '0') p->i++;
+	else if (isdig(peek(p))) { while (isdig(peek(p))) p->i++; }
+	else perr(p, "invalid number");
+	if (peek(p) == '.') {
+		p->i++;
+		if (!isdig(peek(p))) perr(p, "expected digit after '.'");
+		while (isdig(peek(p))) p->i++;
+	}
+	if (peek(p) == 'e' || peek(p) == 'E') {
+		p->i++;
+		if (peek(p) == '+' || peek(p) == '-') p->i++;
+		if (!isdig(peek(p))) perr(p, "expected digit in exponent");
+		while (isdig(peek(p))) p->i++;
+	}
+	om(p->s + start, p->i - start);
+}
+
+static void emit_array(P *p, int lvl)
+{
+	int first = 1;
+
+	p->i++;					/* '[' */
+	skipws(p);
+	if (peek(p) == ']') { p->i++; os_("[]"); return; }
+	os_("[\n");
+	for (;;) {
+		if (!first) os_(",\n");
+		first = 0;
+		emit_indent(lvl + 1);
+		emit_value(p, lvl + 1);
+		skipws(p);
+		if (peek(p) == ',') { p->i++; skipws(p); continue; }
+		if (peek(p) == ']') { p->i++; break; }
+		perr(p, "expected ',' or ']'");
+	}
+	oc('\n');
+	emit_indent(lvl);
+	oc(']');
+}
+
+static void emit_object(P *p, int lvl)
+{
+	int first = 1;
+
+	p->i++;					/* '{' */
+	skipws(p);
+	if (peek(p) == '}') { p->i++; os_("{}"); return; }
+	os_("{\n");
+	for (;;) {
+		if (!first) os_(",\n");
+		first = 0;
+		emit_indent(lvl + 1);
+		emit_string(p);
+		skipws(p);
+		if (peek(p) != ':') perr(p, "expected ':'");
+		p->i++;
+		os_(": ");
+		skipws(p);
+		emit_value(p, lvl + 1);
+		skipws(p);
+		if (peek(p) == ',') { p->i++; skipws(p); continue; }
+		if (peek(p) == '}') { p->i++; break; }
+		perr(p, "expected ',' or '}'");
+	}
+	oc('\n');
+	emit_indent(lvl);
+	oc('}');
+}
+
+static void emit_value(P *p, int lvl)
+{
+	if (++p->depth > MAXDEPTH)
+		perr(p, "nesting too deep");
+	skipws(p);
+	switch (peek(p)) {
+	case '{': emit_object(p, lvl); break;
+	case '[': emit_array(p, lvl); break;
+	case '"': emit_string(p); break;
+	case 't': lit(p, "true");  os_("true");  break;
+	case 'f': lit(p, "false"); os_("false"); break;
+	case 'n': lit(p, "null");  os_("null");  break;
+	case -1:  perr(p, "unexpected end of input"); return;
+	default:
+		if (peek(p) == '-' || isdig(peek(p))) { emit_number(p); break; }
+		perr(p, "unexpected byte, input is not JSON");
+	}
+	p->depth--;
+}
+
 /* ---------- path selection ---------- */
 
-static const jval *select_path(const jval *v, const char *path)
+/* ---------- result sink ----------
+ * A filter produces a stream of values, not a single value. Path
+ * selection happens to produce exactly one, but iteration and
+ * predicates will produce any number, so results are delivered through
+ * a callback rather than returned. Retrofitting this later would mean
+ * rewriting every filter, so it is here from the start.
+ */
+typedef void (*sink_fn)(const jval *v, void *ctx);
+
+/* Prints each value on its own line, the way a stream of results reads. */
+struct print_ctx {
+	int n;
+};
+
+static void print_sink(const jval *v, void *ctx)
+{
+	struct print_ctx *c = ctx;
+
+	if (c->n++)
+		oc('\n');
+	print_val(v, 0);
+}
+
+static const jval *walk_path(const jval *v, const char *path)
 {
 	const char *q = path;
 
@@ -620,6 +989,43 @@ static const jval *select_path(const jval *v, const char *path)
 	return v;
 }
 
+/*
+ * Apply a filter to a document and deliver every result to the sink.
+ *
+ * Today the only filter is a dotted path, which yields exactly one
+ * value or exits with an error. Iteration and predicates will yield
+ * zero or many, which is why nothing here returns a value.
+ *
+ * Execution modes, in increasing cost. Filters should be routed to the
+ * cheapest mode that can express them:
+ *
+ *   1. no filter          stream straight to output, no tree      (main)
+ *   2. forward-only       skip-scan, tree only the target subtree
+ *   3. per-element        stream the outer array, tree one element
+ *                         at a time, arena_restore() between them
+ *   4. whole document     full tree; needed only by filters whose
+ *                         first output depends on the last input
+ *                         (sorting, grouping, deduplication)
+ *
+ * Only modes 1 and 4 exist so far. Mode 3 is the one that matters: it
+ * bounds memory by the largest element rather than the document, so
+ * input stops needing to fit in RAM.
+ */
+static void eval(const jval *root, const char *filter, sink_fn sink, void *ctx)
+{
+	amark m = arena_save();
+
+	sink(walk_path(root, filter), ctx);
+
+	/*
+	 * Anything a filter allocated while producing results is dead once
+	 * the sink has consumed them. A sink that needs to keep a value
+	 * must copy it out. Per-element mode will run this loop once per
+	 * element, which is what bounds memory.
+	 */
+	arena_restore(m);
+}
+
 /* ---------- main ---------- */
 
 static char *slurp(FILE *f, size_t *outlen)
@@ -650,7 +1056,7 @@ int main(int argc, char **argv)
 	size_t len;
 	P p;
 	jval *root;
-	const jval *sel;
+	struct print_ctx out;
 
 	if (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
 		fprintf(stderr, "usage: %s [path]\n"
@@ -668,13 +1074,22 @@ int main(int argc, char **argv)
 	skipws(&p);
 	if (p.i == p.n)
 		die("empty input");
+	if (argc == 1) {			/* no path: stream, never build a tree */
+		emit_value(&p, 0);
+		skipws(&p);
+		if (p.i != p.n)
+			perr(&p, "trailing data after JSON value");
+		oc('\n');
+		oflush();
+		return 0;
+	}
 	root = parse_value(&p);
 	skipws(&p);
 	if (p.i != p.n)
 		perr(&p, "trailing data after JSON value");
 
-	sel = (argc == 2) ? select_path(root, argv[1]) : root;
-	print_val(sel, 0);
+	out.n = 0;
+	eval(root, argv[1], print_sink, &out);
 	oc('\n');
 	oflush();
 	return 0;
