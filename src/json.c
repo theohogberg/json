@@ -184,6 +184,18 @@ static void arr_push(jval *a, jval *item)
 	a->u.arr.v[a->u.arr.n++] = item;
 }
 
+static void obj_push(jval *o, jstr key, jval *item)
+{
+	if (o->u.obj.n == o->u.obj.cap) {
+		o->u.obj.cap = o->u.obj.cap ? o->u.obj.cap * 2 : 8;
+		o->u.obj.k = xrealloc(o->u.obj.k, o->u.obj.cap * sizeof *o->u.obj.k);
+		o->u.obj.v = xrealloc(o->u.obj.v, o->u.obj.cap * sizeof *o->u.obj.v);
+	}
+	o->u.obj.k[o->u.obj.n] = key;
+	o->u.obj.v[o->u.obj.n] = item;
+	o->u.obj.n++;
+}
+
 /* ---------- parser ---------- */
 
 typedef struct {
@@ -1080,6 +1092,70 @@ static const jval *apply_bracket(const jval *v, const char **pp, const char *pat
 	}
 }
 
+/* ---------- globbing ----------
+ * '+' is the wildcard rather than '*' so a pattern survives the shell
+ * unquoted: '*' would be expanded against the working directory before
+ * the program ever runs, silently turning the query into something else.
+ *
+ * Only '+' is supported. Character classes are deliberately absent
+ * because '[' already introduces an index or slice, and a pattern is
+ * matched against one key at a time, so it never spans a '.'.
+ */
+static int is_glob(const char *p, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		if (p[i] == '+')
+			return 1;
+	return 0;
+}
+
+/*
+ * Iterative backtracking match, so a pattern with many wildcards cannot
+ * blow the stack the way a recursive matcher on hostile input would.
+ */
+static int glob_match(const char *pat, size_t pn, const char *str, size_t sn)
+{
+	size_t p = 0, s = 0, star = (size_t)-1, mark = 0;
+
+	while (s < sn) {
+		if (p < pn && pat[p] == '+') {
+			star = p++;		/* remember where to resume */
+			mark = s;
+		} else if (p < pn && pat[p] == str[s]) {
+			p++;
+			s++;
+		} else if (star != (size_t)-1) {
+			p = star + 1;		/* let the last '+' eat one more */
+			s = ++mark;
+		} else {
+			return 0;
+		}
+	}
+	while (p < pn && pat[p] == '+')
+		p++;
+	return p == pn;
+}
+
+/*
+ * Select every pair whose key matches, preserving the container type:
+ * an object in, an object out. Zero matches yields an empty object
+ * rather than an error, because a pattern is a query and querying for
+ * something absent is a legitimate empty answer -- unlike naming a key
+ * that is not there, which stays an error.
+ */
+static const jval *glob_object(const jval *v, const char *pat, size_t pn)
+{
+	jval *out = newval(J_OBJ);
+	size_t i;
+
+	for (i = 0; i < v->u.obj.n; i++)
+		if (glob_match(pat, pn, v->u.obj.k[i].p, v->u.obj.k[i].len))
+			obj_push(out, v->u.obj.k[i], v->u.obj.v[i]);
+	return out;
+}
+
 static const jval *walk_path(const jval *v, const char *path)
 {
 	const char *q = path;
@@ -1098,7 +1174,9 @@ static const jval *walk_path(const jval *v, const char *path)
 			if (klen == 0)
 				die("empty component in path '%s'", path);
 
-			if (v->t == J_OBJ) {
+			if (v->t == J_OBJ && is_glob(q, klen)) {
+				v = glob_object(v, q, klen);
+			} else if (v->t == J_OBJ) {
 				const jval *next = NULL;
 				size_t i;
 				for (i = 0; i < v->u.obj.n; i++) {
@@ -1111,6 +1189,15 @@ static const jval *walk_path(const jval *v, const char *path)
 				if (!next)
 					die("no such key: %.*s", (int)klen, q);
 				v = next;
+			} else if (v->t == J_ARR && is_glob(q, klen)) {
+				/*
+				 * An array has no keys to match. Turning one
+				 * into a stream of its elements is a separate
+				 * operation and is not implemented yet.
+				 */
+				die("cannot glob an array with '%.*s': "
+				    "globbing matches object keys",
+				    (int)klen, q);
 			} else if (v->t == J_ARR) {
 				size_t idx = 0, i;
 				for (i = 0; i < klen; i++) {
@@ -1128,6 +1215,10 @@ static const jval *walk_path(const jval *v, const char *path)
 					die("index %zu out of range (total: %zu)",
 					    idx, v->u.arr.n);
 				v = v->u.arr.v[idx];
+			} else if (is_glob(q, klen)) {
+				die("cannot glob %s with '%.*s': "
+				    "globbing matches object keys",
+				    typename(v->t), (int)klen, q);
 			} else {
 				die("cannot index %s with '%.*s'",
 				    typename(v->t), (int)klen, q);
@@ -1216,6 +1307,11 @@ static void usage(FILE *f)
 "                  slices follow Python rules: negative indices count\n"
 "                  from the end, out-of-range bounds are clamped, and\n"
 "                  the result is a sub-array\n"
+"\n"
+"                  '+' globs object keys: items[0].na+ returns an object\n"
+"                  of every matching key and its value. '+' is used\n"
+"                  instead of '*' so patterns survive the shell without\n"
+"                  quoting. Globbing an array or a scalar is an error.\n"
 "\n"
 "  -r, --raw-output   print a string result without quotes or escapes\n"
 "      --raw          alias for --raw-output\n"

@@ -211,5 +211,28 @@ checkf opt-unknown2 "$A" 1 '' -x
 checkf opt-two-paths "$A" 1 '' a n
 
 
+# --- globbing with '+' (object keys only) ---
+G='{"array":[{"name":"ada","nation":"se","id":1}],"strs":["a","b"],"num":42,"deep":{"a":{"x":1},"ab":{"x":2},"b":{"x":3}}}'
+check glob-prefix    "$G" 'array[0].na+' 0 "$(printf '{\n  "name": "ada",\n  "nation": "se"\n}')"
+check glob-suffix    "$G" 'deep.+b'      0 "$(printf '{\n  "ab": {\n    "x": 2\n  },\n  "b": {\n    "x": 3\n  }\n}')"
+check glob-all       "$G" 'deep.+'       0 "$(printf '{\n  "a": {\n    "x": 1\n  },\n  "ab": {\n    "x": 2\n  },\n  "b": {\n    "x": 3\n  }\n}')"
+check glob-middle    "$G" 'array[0].n+n' 0 "$(printf '{\n  "nation": "se"\n}')"
+check glob-nomatch   "$G" 'deep.zzz+'    0 '{}'
+check glob-exact-still "$G" 'deep.a'     0 "$(printf '{\n  "x": 1\n}')"
+check glob-missing-key "$G" 'deep.zzz'   1 ''
+
+# globbing is only defined on objects
+check glob-on-array  "$G" 'array.n+'     1 ''
+check glob-on-strarr "$G" 'strs.+'       1 ''
+check glob-on-scalar "$G" 'num.+'        1 ''
+check glob-on-slice  "$G" 'array[0:1].n+' 1 ''
+
+# a glob result is an ordinary object and can be walked further
+check glob-then-key  "$G" 'deep.a+'      0 "$(printf '{\n  "a": {\n    "x": 1\n  },\n  "ab": {\n    "x": 2\n  }\n}')"
+
+# raw output applies to a matched string like any other
+checkf glob-raw      "$G" 0 "$(printf '{\n  "name": "ada",\n  "nation": "se"\n}')" -r 'array[0].na+'
+
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
