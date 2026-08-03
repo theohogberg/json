@@ -174,12 +174,29 @@ static const char *typename(jtype t)
 	return "?";
 }
 
+/*
+ * Values built while answering a query -- slice results, glob results --
+ * grow out of the arena rather than the heap, so a per-element reset
+ * reclaims them. Growth copies into a fresh block and abandons the old
+ * one; the arena makes that cheap and the reset makes it bounded.
+ */
+static void *arena_grow(void *old, size_t oldn, size_t newn, size_t esz)
+{
+	void *p = arena_alloc(newn * esz);
+
+	if (oldn)
+		memcpy(p, old, oldn * esz);
+	return p;
+}
+
 static void arr_push(jval *a, jval *item)
 {
 	if (a->u.arr.n == a->u.arr.cap) {
-		a->u.arr.cap = a->u.arr.cap ? a->u.arr.cap * 2 : 8;
-		a->u.arr.v = xrealloc(a->u.arr.v,
-				      a->u.arr.cap * sizeof *a->u.arr.v);
+		size_t cap = a->u.arr.cap ? a->u.arr.cap * 2 : 8;
+
+		a->u.arr.v = arena_grow(a->u.arr.v, a->u.arr.n, cap,
+					sizeof *a->u.arr.v);
+		a->u.arr.cap = cap;
 	}
 	a->u.arr.v[a->u.arr.n++] = item;
 }
@@ -187,9 +204,13 @@ static void arr_push(jval *a, jval *item)
 static void obj_push(jval *o, jstr key, jval *item)
 {
 	if (o->u.obj.n == o->u.obj.cap) {
-		o->u.obj.cap = o->u.obj.cap ? o->u.obj.cap * 2 : 8;
-		o->u.obj.k = xrealloc(o->u.obj.k, o->u.obj.cap * sizeof *o->u.obj.k);
-		o->u.obj.v = xrealloc(o->u.obj.v, o->u.obj.cap * sizeof *o->u.obj.v);
+		size_t cap = o->u.obj.cap ? o->u.obj.cap * 2 : 8;
+
+		o->u.obj.k = arena_grow(o->u.obj.k, o->u.obj.n, cap,
+					sizeof *o->u.obj.k);
+		o->u.obj.v = arena_grow(o->u.obj.v, o->u.obj.n, cap,
+					sizeof *o->u.obj.v);
+		o->u.obj.cap = cap;
 	}
 	o->u.obj.k[o->u.obj.n] = key;
 	o->u.obj.v[o->u.obj.n] = item;
@@ -1156,13 +1177,149 @@ static const jval *glob_object(const jval *v, const char *pat, size_t pn)
 	return out;
 }
 
-static const jval *walk_path(const jval *v, const char *path)
+/*
+ * Apply one key component to a value. Returns the selected value, or
+ * dies -- a named key that is absent is an error, while a pattern that
+ * matches nothing yields an empty object.
+ */
+static const jval *apply_key(const jval *v, const char *q, size_t klen)
 {
-	const char *q = path;
+	if (v->t == J_OBJ && is_glob(q, klen))
+		return glob_object(v, q, klen);
+
+	if (v->t == J_OBJ) {
+		size_t i;
+
+		for (i = 0; i < v->u.obj.n; i++)
+			if (v->u.obj.k[i].len == klen &&
+			    memcmp(v->u.obj.k[i].p, q, klen) == 0)
+				return v->u.obj.v[i];
+		die("no such key: %.*s", (int)klen, q);
+	}
+
+	if (v->t == J_ARR) {
+		size_t idx = 0, i;
+
+		if (is_glob(q, klen))
+			die("cannot glob an array with '%.*s': globbing "
+			    "matches object keys (use [@] for a stream)",
+			    (int)klen, q);
+		for (i = 0; i < klen; i++) {
+			size_t d;
+
+			if (!isdig((unsigned char)q[i]))
+				die("cannot index array with '%.*s'",
+				    (int)klen, q);
+			d = (size_t)(q[i] - '0');
+			if (idx > (SIZE_MAX - d) / 10)
+				die("index '%.*s' is too large", (int)klen, q);
+			idx = idx * 10 + d;
+		}
+		if (idx >= v->u.arr.n)
+			die("index %zu out of range (total: %zu)",
+			    idx, v->u.arr.n);
+		return v->u.arr.v[idx];
+	}
+
+	if (is_glob(q, klen))
+		die("cannot glob %s with '%.*s': globbing matches object keys",
+		    typename(v->t), (int)klen, q);
+	die("cannot index %s with '%.*s'", typename(v->t), (int)klen, q);
+	return NULL;				/* not reached */
+}
+
+/*
+ * Find the ']' closing the bracket that starts at s. Nested brackets are
+ * counted, so [@[0]] matches the outer one.
+ */
+static const char *bracket_end(const char *s, const char *path)
+{
+	int depth = 0;
+
+	for (; *s; s++) {
+		if (*s == '[')
+			depth++;
+		else if (*s == ']' && --depth == 0)
+			return s;
+	}
+	die("unclosed '[' in path '%s'", path);
+	return NULL;				/* not reached */
+}
+
+static void walk(const jval *v, const char *q, const char *path,
+		 sink_fn sink, void *ctx, int depth);
+
+/*
+ * [@...] converts an array into a stream: the remainder of the path is
+ * applied to each element in turn and every result is delivered to the
+ * sink separately, rather than being collected into one value.
+ *
+ * Anything written inside the brackets after '@' is simply the start of
+ * that remainder, so array[@.na+] and array[@].na+ mean the same thing.
+ * The two are spliced into one sub-path here, once per stream rather
+ * than once per element.
+ */
+static void stream_array(const jval *v, const char *inner, size_t ilen,
+			 const char *rest, const char *path,
+			 sink_fn sink, void *ctx, int depth)
+{
+	size_t rlen = strlen(rest);
+	char *sub;
+	size_t i;
+	amark m;
+
+	if (v->t != J_ARR)
+		die("cannot stream %s with [@]: [@] converts an array into a "
+		    "stream of its elements", typename(v->t));
+
+	sub = arena_alloc(ilen + rlen + 1);
+	memcpy(sub, inner, ilen);
+	memcpy(sub + ilen, rest, rlen);
+	sub[ilen + rlen] = '\0';
+
+	/*
+	 * A lone '.' means identity at the top level, but inside brackets
+	 * it is a trailing separator with nothing after it, which is an
+	 * error everywhere else in a path.
+	 */
+	if (ilen + rlen > 0 && sub[ilen + rlen - 1] == '.')
+		die("empty component in path '%s'", path);
+
+	/*
+	 * Taken after sub is allocated so the sub-path survives the loop.
+	 * Anything a single element's filter allocates -- a glob result,
+	 * a slice -- is dead once the sink has consumed it, so the next
+	 * element reuses that memory instead of the arena growing with
+	 * the length of the stream.
+	 */
+	m = arena_save();
+	for (i = 0; i < v->u.arr.n; i++) {
+		walk(v->u.arr.v[i], sub, path, sink, ctx, depth + 1);
+		arena_restore(m);
+	}
+}
+
+/*
+ * Walk a path from position q, delivering every result to the sink.
+ * Most paths yield exactly one value; [@] is what makes the count vary,
+ * which is why nothing here returns a value.
+ */
+static void walk(const jval *v, const char *q, const char *path,
+		 sink_fn sink, void *ctx, int depth)
+{
+	if (depth > MAXDEPTH)
+		die("path nesting too deep");
 
 	if (*q == '.')				/* allow both a.b and .a.b */
 		q++;
 	while (*q) {
+		if (*q == '[' && q[1] == '@') {
+			const char *end = bracket_end(q, path);
+
+			stream_array(v, q + 2, (size_t)(end - (q + 2)),
+				     end + 1, path, sink, ctx, depth);
+			return;			/* the recursion finishes it */
+		}
 		if (*q == '[') {
 			q++;
 			v = apply_bracket(v, &q, path);
@@ -1173,56 +1330,7 @@ static const jval *walk_path(const jval *v, const char *path)
 				klen++;
 			if (klen == 0)
 				die("empty component in path '%s'", path);
-
-			if (v->t == J_OBJ && is_glob(q, klen)) {
-				v = glob_object(v, q, klen);
-			} else if (v->t == J_OBJ) {
-				const jval *next = NULL;
-				size_t i;
-				for (i = 0; i < v->u.obj.n; i++) {
-					if (v->u.obj.k[i].len == klen &&
-					    memcmp(v->u.obj.k[i].p, q, klen) == 0) {
-						next = v->u.obj.v[i];
-						break;
-					}
-				}
-				if (!next)
-					die("no such key: %.*s", (int)klen, q);
-				v = next;
-			} else if (v->t == J_ARR && is_glob(q, klen)) {
-				/*
-				 * An array has no keys to match. Turning one
-				 * into a stream of its elements is a separate
-				 * operation and is not implemented yet.
-				 */
-				die("cannot glob an array with '%.*s': "
-				    "globbing matches object keys",
-				    (int)klen, q);
-			} else if (v->t == J_ARR) {
-				size_t idx = 0, i;
-				for (i = 0; i < klen; i++) {
-					size_t d;
-					if (!isdig((unsigned char)q[i]))
-						die("cannot index array with '%.*s'",
-						    (int)klen, q);
-					d = (size_t)(q[i] - '0');
-					if (idx > (SIZE_MAX - d) / 10)
-						die("index '%.*s' is too large",
-						    (int)klen, q);
-					idx = idx * 10 + d;
-				}
-				if (idx >= v->u.arr.n)
-					die("index %zu out of range (total: %zu)",
-					    idx, v->u.arr.n);
-				v = v->u.arr.v[idx];
-			} else if (is_glob(q, klen)) {
-				die("cannot glob %s with '%.*s': "
-				    "globbing matches object keys",
-				    typename(v->t), (int)klen, q);
-			} else {
-				die("cannot index %s with '%.*s'",
-				    typename(v->t), (int)klen, q);
-			}
+			v = apply_key(v, q, klen);
 			q += klen;
 		}
 		if (*q == '.') {
@@ -1231,7 +1339,7 @@ static const jval *walk_path(const jval *v, const char *path)
 				die("empty component in path '%s'", path);
 		}
 	}
-	return v;
+	sink(v, ctx);
 }
 
 /*
@@ -1260,7 +1368,7 @@ static void eval(const jval *root, const char *filter, sink_fn sink, void *ctx)
 {
 	amark m = arena_save();
 
-	sink(walk_path(root, filter), ctx);
+	walk(root, filter, filter, sink, ctx, 0);
 
 	/*
 	 * Anything a filter allocated while producing results is dead once
@@ -1312,6 +1420,12 @@ static void usage(FILE *f)
 "                  of every matching key and its value. '+' is used\n"
 "                  instead of '*' so patterns survive the shell without\n"
 "                  quoting. Globbing an array or a scalar is an error.\n"
+"\n"
+"                  [@] turns an array into a stream, printing each result\n"
+"                  separately. The rest of the path applies to every\n"
+"                  element, so items[@].name and items[@.name] are the\n"
+"                  same, and items[-100:][@.+ie] streams the last hundred\n"
+"                  elements filtered to keys ending in 'ie'.\n"
 "\n"
 "  -r, --raw-output   print a string result without quotes or escapes\n"
 "      --raw          alias for --raw-output\n"

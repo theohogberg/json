@@ -234,5 +234,28 @@ check glob-then-key  "$G" 'deep.a+'      0 "$(printf '{\n  "a": {\n    "x": 1\n 
 checkf glob-raw      "$G" 0 "$(printf '{\n  "name": "ada",\n  "nation": "se"\n}')" -r 'array[0].na+'
 
 
+# --- [@] : array to stream of elements ---
+S='{"a":[{"name":"ada","nationalitie":"se","movie":1},{"name":"bob","nationalitie":"no","movie":2}],"n":[[1,2],[3,4]],"num":5,"o":{"k":1}}'
+check st-plain     "$S" 'a[@].name'   0 "$(printf '"ada"\n"bob"')"
+check st-inner     "$S" 'a[@.name]'   0 "$(printf '"ada"\n"bob"')"
+check st-glob      "$S" 'a[@.+ie]'    0 "$(printf '{\n  "nationalitie": "se",\n  "movie": 1\n}\n{\n  "nationalitie": "no",\n  "movie": 2\n}')"
+check st-slice     "$S" 'a[-1:][@.name]' 0 '"bob"'
+check st-whole     "$S" 'a[@]'        0 "$(printf '{\n  "name": "ada",\n  "nationalitie": "se",\n  "movie": 1\n}\n{\n  "name": "bob",\n  "nationalitie": "no",\n  "movie": 2\n}')"
+check st-nested    "$S" 'n[@][@]'     0 "$(printf '1\n2\n3\n4')"
+check st-index     "$S" 'n[@][0]'     0 "$(printf '1\n3')"
+check st-empty     "$S" 'a[0:0][@]'   0 ''
+checkf st-raw      "$S" 0 "$(printf 'ada\nbob')" -r 'a[@.name]'
+
+# [@] is defined on arrays only
+check st-on-scalar "$S" 'num[@]'      1 ''
+check st-on-object "$S" 'o[@]'        1 ''
+check st-unclosed  "$S" 'a[@'         1 ''
+check st-traildot  "$S" 'a[@.]'       1 ''
+check st-traildot2 "$S" 'a[@].'       1 ''
+
+# a named key absent from any element still fails the whole query
+check st-missing   "$S" 'n[@].name'   1 ''
+
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
