@@ -1,109 +1,71 @@
-CC       ?= cc
-CFLAGS   ?= -std=c99 -O3 -Wall -Wextra -pedantic
-PREFIX   ?= /usr/local
+CC      ?= cc
+CFLAGS  ?= -std=c99 -O3 -Wall -Wextra -pedantic
+PREFIX  ?= /usr/local
+RUNS    ?= 5000
 
-# Recursion cap. Costs about 64 bytes of stack per level, so this is
-# negligible against a default stack. Anything nested deeper than this is
-# a generated structure rather than data anyone wrote or needs to read.
-DEPTH    ?= 1024
+# Recursion cap: ~64 bytes of stack per level. Deeper is generated, not data.
+DEPTH   ?= 1024
 
-INCS      = -Iinclude
-LDFLAGS  += -Llib
+# The tool never frees, so the leak checker would only mask real findings.
+SANENV   = ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+SAN      = -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
 
-# every src/<name>.c is built as its own variant
-VARIANTS  = $(patsubst src/%.c,%,$(wildcard src/*.c))
-OUT       = out
-BINS      = $(addprefix $(OUT)/,$(VARIANTS))
-ASANS     = $(addsuffix .asan,$(BINS))
-
-# which variant `make install` ships
-MAIN     ?= json
-
-SAN       = -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
-# the tool deliberately never frees; exit reclaims. turn off the leak
-# checker so it does not mask real findings.
-SANENV    = ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+# every src/<name>.c is a variant
+VARIANTS = $(basename $(notdir $(wildcard src/*.c)))
+BINS     = $(VARIANTS:%=out/%)
 
 all: $(BINS)
 
-# order-only (|) so writing a binary into out/ does not stamp the directory
-# newer than the binary and force a rebuild every time.
-$(OUT):
-	mkdir -p $(OUT)
-
-# Make compares timestamps, not flags, so changing DEPTH or CFLAGS on the
-# command line would otherwise reuse stale binaries and silently test the
-# wrong thing. Record the flags in a stamp file and rebuild when it moves.
-FLAGSIG = $(CC) $(CFLAGS) -DMAXDEPTH=$(DEPTH)
-$(OUT)/.flags: FORCE | $(OUT)
-	@echo '$(FLAGSIG)' | cmp -s - $@ 2>/dev/null || echo '$(FLAGSIG)' > $@
+# Make compares timestamps, not flags; record them so DEPTH/CFLAGS changes rebuild.
+out/.flags: FORCE
+	@mkdir -p out
+	@echo '$(CC) $(CFLAGS) $(DEPTH)' | cmp -s - $@ || echo '$(CC) $(CFLAGS) $(DEPTH)' > $@
 FORCE:
 
-# %.asan is the more specific pattern, so make prefers it for out/x.asan
-$(OUT)/%.asan: src/%.c $(OUT)/.flags | $(OUT)
-	$(CC) $(SAN) -DMAXDEPTH=$(DEPTH) $(INCS) $(LDFLAGS) -o $@ $<
+out/%.asan: src/%.c out/.flags
+	$(CC) $(SAN) -DMAXDEPTH=$(DEPTH) -o $@ $<
 
-$(OUT)/%: src/%.c $(OUT)/.flags | $(OUT)
-	$(CC) $(CFLAGS) -DMAXDEPTH=$(DEPTH) $(INCS) $(LDFLAGS) -o $@ $<
+out/%: src/%.c out/.flags
+	$(CC) $(CFLAGS) -DMAXDEPTH=$(DEPTH) -o $@ $<
 
-# ---- per-variant targets: test-<variant>, check-<variant>, ... ----
+test-%: out/%
+	JSON=out/$* DEPTH=$(DEPTH) sh test/test.sh
 
-test-%: $(OUT)/%
-	@echo "== test: $* =="
-	@DEPTH=$(DEPTH) JSON=$(OUT)/$* ./test/test.sh
+conformance-%: out/% JSONTestSuite
+	JSON=out/$* sh test/conformance.sh
 
-conformance-%: $(OUT)/% JSONTestSuite
-	@echo "== conformance: $* =="
-	@JSON=$(OUT)/$* ./test/conformance.sh
+check-%: out/%.asan JSONTestSuite
+	$(SANENV) JSON=out/$*.asan DEPTH=$(DEPTH) sh test/test.sh
+	$(SANENV) JSON=out/$*.asan sh test/conformance.sh
 
-check-%: $(OUT)/%.asan JSONTestSuite
-	@echo "== check (asan+ubsan): $* =="
-	@$(SANENV) DEPTH=$(DEPTH) JSON=$(OUT)/$*.asan ./test/test.sh
-	@$(SANENV) JSON=$(OUT)/$*.asan ./test/conformance.sh
+fuzz-%: out/%.asan
+	$(SANENV) python3 test/fuzz.py $(RUNS) out/$*.asan
 
-fuzz-%: $(OUT)/%.asan
-	@echo "== fuzz: $* =="
-	@$(SANENV) python3 test/fuzz.py $(RUNS) $(OUT)/$*.asan
+test:        $(VARIANTS:%=test-%)
+conformance: $(VARIANTS:%=conformance-%)
+check:       $(VARIANTS:%=check-%)
+fuzz:        $(VARIANTS:%=fuzz-%)
 
-RUNS ?= 5000
-
-# ---- aggregate targets: same thing across every variant ----
-
-test:        $(addprefix test-,$(VARIANTS))
-conformance: $(addprefix conformance-,$(VARIANTS))
-check:       $(addprefix check-,$(VARIANTS))
-fuzz:        $(addprefix fuzz-,$(VARIANTS))
-
-# all variants must agree byte for byte on the same input
+# all variants must emit identical output
 diff: $(BINS)
-	@f=test/test.json; ref=$(firstword $(BINS)); \
-	$$ref < $$f > $(OUT)/.ref; \
-	for b in $(BINS); do \
-		$$b < $$f > $(OUT)/.cmp; \
-		if cmp -s $(OUT)/.ref $(OUT)/.cmp; then echo "  ok   $$b"; \
-		else echo "  DIFF $$b"; rm -f $(OUT)/.ref $(OUT)/.cmp; exit 1; fi; \
-	done; rm -f $(OUT)/.ref $(OUT)/.cmp
+	@$(firstword $(BINS)) < test/test.json > out/.ref
+	@for b in $(BINS); do $$b < test/test.json | cmp - out/.ref && echo "ok $$b" || exit 1; done
 
 ci: test check fuzz conformance diff
 
 JSONTestSuite:
 	git clone --depth 1 https://github.com/nst/JSONTestSuite.git
 
-tags: $(wildcard src/*.c)
-	ctags -R src include
-
-install: $(OUT)/$(MAIN)
+install: out/json
 	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 755 $(OUT)/$(MAIN) $(DESTDIR)$(PREFIX)/bin/json
+	install -m 755 out/json $(DESTDIR)$(PREFIX)/bin/json
 
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/json
 
 clean:
-	rm -rf $(OUT)
+	rm -rf out
 
-# NB: the per-variant test-%/check-%/fuzz-% targets are deliberately NOT
-# listed here. Declaring a target phony stops make from searching for a
-# pattern rule to build it, which would break them. They never exist as
-# files, so they always run anyway.
-.PHONY: all test conformance check fuzz diff ci tags install uninstall clean FORCE
+# test-%/check-%/fuzz-% are deliberately not phony: that would stop make
+# from matching them against the pattern rules.
+.PHONY: all test conformance check fuzz diff ci install uninstall clean FORCE

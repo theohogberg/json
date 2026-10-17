@@ -7,7 +7,7 @@
 #
 # Only y_ and n_ failures are bugs.
 
-JSON=${JSON:-./json}
+JSON=${JSON:-out/json}
 DIR=${DIR:-JSONTestSuite/test_parsing}
 yfail=0 nfail=0 pass=0 idef=0
 

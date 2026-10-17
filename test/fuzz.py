@@ -15,7 +15,7 @@ import random
 import subprocess
 import sys
 
-BIN = sys.argv[2] if len(sys.argv) > 2 else "./json"
+BIN = sys.argv[2] if len(sys.argv) > 2 else "out/json"
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
 
 ATOMS = [
