@@ -1,12 +1,14 @@
 # json
 
-A zero-dependency JSON formatter and query tool for the shell. C99, libc only,
-one translation unit: `src/json.c`.
+A zero-dependency JSON formatter and query tool for the shell. C99 plus POSIX
+`read`/`fstat`, libc only, one translation unit: `src/json.c` (which includes
+the generated `src/unicat.h`).
 
 ```
 curl -s URL | json                      # reformat
 curl -s URL | json users.0.name         # select
 curl -s URL | json -r users[@.name]     # stream, unquoted
+curl -s URL | json --rfc9535 '$.users[?@.age > 30].name'
 ```
 
 ## Build and test
@@ -17,49 +19,71 @@ make test                 # regression suite
 make scalar               # same suite, built -DNOSIMD
 make check                # suite + conformance under ASan+UBSan
 make conformance          # JSONTestSuite (cloned on first run)
+make jsonpath             # JSONPath Compliance Test Suite (cloned on first run)
 make fuzz [SEED=N]        # differential vs Python's json; prints its seed
 make diff                 # SIMD and scalar builds must emit identical output
-make ci                   # all of the above, ~90 s — run before committing
+make ci                   # all of the above, ~2 min — run before committing
 make DEPTH=256 test       # flag changes rebuild; checked when make starts
 ```
 
-`make ci` must be green before any commit. Baseline: **76/76 tests, 283/283
-conformance, fuzz clean**.
+`make ci` must be green before any commit. Baseline: **107/107 tests, 283/283
+conformance, 713/713 JSONPath compliance (2 skipped: NUL in the selector),
+fuzz clean**.
 
 ## Non-negotiables
 
 Settled decisions, not preferences. Changing one needs a reason.
 
 - **No dependencies beyond libc.** No getopt_long (GNU-only), nothing
-  third-party. Option parsing is hand-rolled on purpose.
+  third-party. Option parsing is hand-rolled on purpose. POSIX `read(2)` and
+  `fstat(2)` are the only non-C99 calls (`_POSIX_C_SOURCE` at the top).
 - **Builds clean** under `-std=c99 -O3 -Wall -Wextra -pedantic`. Fix a
   warning, don't silence it.
 - **Output is byte-identical to `jq .`** for reformatting (verified on 4.6 MB
   against jq 1.7.1). A change that alters output is a bug unless it's the point.
 - **Never free.** Exit reclaims. LeakSanitizer is therefore useless, and
   `ASAN_OPTIONS=detect_leaks=0` in `SANENV` must stay.
-- **Numbers keep their raw lexeme** (a pointer into the input buffer), so
-  `1.50` and `1e309` round-trip. Never convert to double. The input buffer must
-  outlive the tree.
+- **Numbers keep their raw lexeme**, so `1.50` and `1e309` round-trip. Never
+  convert to double, not even to compare: RFC filters compare lexemes as exact
+  decimals (`numcmp`). A slurped buffer never moves, so the tree points into
+  it; a streamed window does, so `parse_value` copies lexemes to the arena.
 
 ## Architecture
+
+**Input: slurp or stream, by `fstat`.** `input()` reads a regular file under
+`SLURP_MAX` (256 MiB) whole, in one `read`. Anything else (pipe, socket,
+terminal, huge file) streams through a `WINDOW` (64 KiB) that `more()` slides,
+keeping the unread `s[i..n)`. So **scanners never advance `i` mid-token**:
+`str_end` re-bases in `str_slow`, `scan_number` rescans a number that runs
+into the window's end, `lit` asks `avail()`. `skipws()` leaves a byte in the
+window unless input is over, which is why `peek()` never refills. `more()`
+flushes output before it blocks, so results appear before EOF. Piped, any
+input reformats or answers `[@.name]` in ~1.3 MB.
 
 1. **No filter → streaming.** `emit_value()` validates and reformats in one
    pass, no allocation, no tree. ~18x faster than jq; never route it through
    the tree.
-2. **Filter → tree.** `parse_value()` builds a DOM, `walk()` applies the path,
-   results go to a `sink_fn`.
+2. **Path → `swalk()` over the parse.** A key or a non-negative index steps
+   into one member and `skip_value()`s the rest unbuilt; `[@]` handles one
+   element at a time. Whatever needs a value whole (globs, slices, negative
+   indexes, `-r` strings) and every error goes to `walk()` on a tree of just
+   that value, so the two share one set of semantics. Output can precede a
+   parse error later in the input; the exit code is still 1.
+3. **`--rfc9535` → tree.** The query compiles first (`rfc_parse`), so a bad
+   one fails before input is read. `$` in a filter can reach anything, so the
+   whole document is parsed; `r_apply()` sends nodes to the sink depth first,
+   which is RFC order.
 
 **Results go through a sink** because `[@]` makes the result count a runtime
 property; anything returning one value had to be rewritten once already. A
 stream is a stream whatever its cardinality: a future collect flag must give
 `["ada"]`, not `"ada"`, for a one-element array.
 
-**Per-element memory is bounded.** `stream_array()` restores an arena mark
-after each element, so everything built while answering a query must come from
-the arena (`push` uses `arena_grow`, never `xrealloc`). At 400k elements `[@]`,
-`[@.name]` and `[@.+ie]` peak within noise of each other (~150 MB; macOS RSS
-varies ±5% run to run).
+**Per-element memory is bounded.** `sstream()` and `stream_array()` restore an
+arena mark after each element, so everything built while answering a query
+must come from the arena (`push` uses `arena_grow`, never `xrealloc`). On a
+15 MB file piped, `[@]`, `[@.name]` and `[@.+ie]` all peak at ~1.3 MB; `[-1]`
+still trees the whole array.
 
 **The tree is exact-size.** The parser does not use `push`: doubling in the
 arena abandons every outgrown block (+14% RSS). Children collect on a reusable
@@ -67,10 +91,13 @@ scratch stack and each container is copied into the arena once when it closes:
 84 MB on a 12 MB file, against 141 MB for the old realloc tree. Arena alignment
 is 8; 16 padded every 40-byte `jval` to 48.
 
-**Hot-path inlining is load-bearing.** `om`, `str_end` and `scan_number` are
-`always_inline`, with rare branches split into `om_slow`/`str_slow`. Without
-it clang won't inline them and short strings run 15–25% slower. Literals are
-emitted with constant-length `os_`; the variable-length copy cost 8%.
+**Hot-path inlining is load-bearing.** `om`, `os_`, `str_end`, `num_len` and
+`scan_number` are `always_inline`, with rare branches split into
+`om_slow`/`str_slow`, which are `COLD` (noinline): left to itself clang inlined
+`om_slow` back into every `om` once the file grew. Without it short strings run
+15–25% slower. Literals are emitted with constant-length `os_`; the
+variable-length copy cost 8%, and `os_` stopped inlining when the RFC code was
+added.
 
 **SIMD.** None yet. `scan_str` and `scan_ws` are the only functions intrinsics
 belong in: read only `s[0..n)`, return what the scalar loop would, fall through
@@ -88,7 +115,11 @@ users.0.name        dotted path; works on objects and arrays
 users[0]            bracket index, negative allowed: users[-1]
 users[1:3]          slice — Python semantics exactly
 users.na+           glob object keys; '+' not '*'
-users[@.name]       stream: array → one result per element
+users[@.name]       stream: one result per element, or per object value
+users[?@.age > 30]  filter: stream the elements (or values) that match
+..id  a..name       search every depth: ..key, ..['k'], ..[n], ..[@], ..[?]
+['a.b']  ["x y"]    quoted name: any key, '.', '[', '+' and all
+a[0:3,1]  o['x','y']  union: one sub-array or sub-object, each member once
 ```
 
 **Slices are Python's**, verified case by case: negative indices, clamped
@@ -102,20 +133,64 @@ valid query). `+` survives sh, bash and zsh unquoted. Otherwise exactly
 means index-or-slice. Globbing an object returns an object; globbing anything
 else is an error.
 
+**`--rfc9535`** switches to RFC 9535 JSONPath: `$` required, `[*]`, `..`,
+`['name']`, unions, filters `[?...]` with `== != < <= > >=`, `&& || !`, and
+`length count value match search`. Results are a nodelist, one node per line,
+nothing (and rc 0) for none; a slice yields its elements, step 0 selects
+nothing, a missing key selects nothing. `match`/`search` take I-Regexp
+(RFC 9485) on a Pike VM over code points, so no pattern backtracks; `\p{..}`
+uses `src/unicat.h`, generated by `src/unicat.py` from Python's Unicode
+tables. `^` and `$` anchor, although RFC 9485's grammar makes them plain
+characters, because the compliance suite expects it. Duplicate keys select
+the first, as in the default dialect.
+
+**`[?...]` filters are RFC 9535's**, parsed and evaluated by the RFC code
+(`path_filter`, `x_true`), so inside one `@`/`$` paths are JSONPath
+(`@.tags[0]`, not `@.tags.0`) and a missing member is false, not an error.
+`match()`/`search()` are refused: regex in the standard dialect will get its
+own behaviour later. A filter streams each matching element or object value
+through the rest of the path, as `[@]` does. `bracket_end`
+skips a filter whole, so `"]"` inside one is safe. All filters compile before
+input is read; one using `$` makes `main` tree the whole document, otherwise
+`sfilter()` trees one element at a time (1.4 MB piped on 15 MB).
+
+**`[@]` and `[?]` take arrays and objects**; on an object they see the
+values and drop the keys, so `users[@.name]` works whether users is a list or
+a map like `{"u1": {...}}`. That is RFC's `*`, spelled the shell-safe way.
+
+**`..` is a search**, so it never errors on what it doesn't find: `..id` is
+`$..id`, the selector applied to the node and then to every descendant, depth
+first, a node's own matches before its children's (RFC and jq order). What
+follows the selector applies to each match with the usual strictness, so
+`..[@.name]` fails on the first element without `name`; write `..name`.
+`..` trees the value it searches.
+
+**Quoted names** (`['a.b']`, `["x y"]`) take RFC string syntax and escapes and
+select exactly that key: no globbing, missing is an error. `bracket_end` and
+the root prescan skip them whole, so `['k]']` is safe; a quote starts a name
+only right after `[` or `,`.
+
+**Unions keep the shape, unlike RFC's.** `a[0:3,1]` is one array `[a0, a1, a2]`
+and `o['y','x']` one object, as a slice or a glob is one value: each member
+once, in the order first asked, never a stream. A missing name or index
+errors; a slice in a union clamps. Names need an object and indexes an array.
+Whitespace is allowed inside brackets.
+
 **`[@...]` is meant to be terminal**: `users[@.name]`, with nesting as
 `n[@[@]]`, because a stream is not an object for a `.` suffix to select from.
 Not enforced yet: `users[@].name` still succeeds.
 
 **Errors vs empty.** An absent named key is an error (exit 1); a pattern
 matching nothing is empty — Python's `d['x']` vs a comprehension. Out-of-range
-index errors; out-of-range slice clamps.
+index errors; out-of-range slice clamps. A filter or a `..` search that finds
+nothing is empty.
 
 ## Flags
 
 ```
 -r, --raw-output    string result without quotes or escapes
     --raw           alias
-    --rfc9535       recognized, refuses to run (see below)
+    --rfc9535       the path is RFC 9535 JSONPath (see Query syntax)
 -h, --help
 --                  end of options
 ```
@@ -127,15 +202,13 @@ output is still JSON. `--raw-output` is primary because jq also has
 
 ## Not implemented
 
-- **`--rfc9535`** exits naming what would change: slices yielding one result
-  per element, a missing key yielding empty. Placeholder for full JSONPath.
-- **`[?...]` predicates**, e.g. `[?@.name == 'john']`. The next feature. `@`
-  must mean "current element" so `[@.x]` and `[?@.x == 1]` read alike.
+- **Regex in standard filters.** `match`/`search` exist only under
+  `--rfc9535`; the standard dialect will get its own regex behaviour.
+- **Streaming `--rfc9535`.** It always builds the whole tree; `$.a[*].b` with
+  no `$` in a filter could stream like `[@]`.
 - **Multiple JSON values on stdin.** A second value is "trailing data" today,
-  so `json a[@.x] | json y` cannot compose. A prerequisite for pipelines.
-- **Incremental input.** `slurp()` reads to EOF, so input must fit in RAM. The
-  streaming path and tree numbers point into the input buffer, so this needs a
-  sliding window with flush-before-refill, or number lexemes copied out.
+  so `json a[@.x] | json y` cannot compose. The window makes this a matter of
+  looping in `main`.
 - **Error tolerance.** `n[@.name]` fails if any element lacks `name`. jq's `?`
   is the precedent; it is unrelated to RFC 9535's `[?...]`, so decide the
   spelling before implementing either.
@@ -143,18 +216,23 @@ output is still JSON. `--raw-output` is primary because jq also has
 ## Testing
 
 `test/test.sh` (`t NAME INPUT RC OUT [ARGS...]`; stdout checked only on rc 0),
-`test/conformance.sh` (JSONTestSuite), `test/fuzz.py` (vs Python), and
-`test/corpus.py` (input for `make diff`). Everything runs one process per core
+`test/conformance.sh` (JSONTestSuite), `test/jsonpath.py` (the JSONPath
+Compliance Test Suite), `test/fuzz.py` (vs Python), and `test/corpus.py`
+(input for `make diff`). The first three run every case twice, piped
+(streamed) and redirected (slurped), and the ASan build uses `-DWINDOW=7` so
+`make check` puts every token across a refill. Everything runs one process per core
 (`JOBS=N` for the shell scripts): a sanitizer build spends ~45 ms starting and
 <1 ms working, and no `ASAN_OPTIONS` setting changes that.
 
-**The suite is minimal by measurement; don't prune or pad it by eye.** It was
-cut from 140 cases with 1291 mutants of `json.c` (operator, literal and ±1
+**The suite is minimal by measurement; don't prune or pad it by eye.** The 76
+default-dialect cases were cut from 140 with 1291 mutants of `json.c` (operator, literal and ±1
 swaps including hex, statement deletion, and each `die`/`perr` turned into a
 silent `exit(0)`). Each of the 76 cases is the only one catching some mutant.
 A by-judgement pass had kept 111 yet dropped six cases that were the only ones
 catching something. Error cases check only the exit code, so only the `exit(0)`
-operator tells error sites apart.
+operator tells error sites apart. The `flt-`, `desc-`, `qname-`, `union-`, `obj-` and `rfc-` cases (the `rfc-` ones cover what the compliance
+suite cannot: output format, `-r`, exact numbers) have not been through a
+mutation run yet.
 
 Add a case for every behaviour change. Known gaps: no case reaches the tree
 parser's syntax errors (malformed input is only tested without a filter, and
@@ -176,8 +254,11 @@ Against jq 1.7.1 on a 4.6 MB array of 15,840 objects, output byte-identical:
 | reformat whole doc | 154.8 ms | 8.5 ms (18x) |
 | select one deep value | 54.0 ms | 12.5 ms (4.3x) |
 
-`jq .` and `json` both use memory proportional to input; `jq --stream` is flat
-at 6.2 MB and we have no equivalent.
+Those predate streaming. Against the previous commit, on a 15 MB array of
+60,000 objects (best of 20; arm64): reformatting a file 32.5 → 34.1 ms (the
+refill checks; piped 36.4 → 34.2), `5000.nested.a.b` 32 → 24 ms and
+`[@.name]` 38 → 27 ms, at 15.7 MB instead of 80 MB from a file and 1.3 MB
+piped. `jq --stream` is flat at 6.2 MB.
 
 Measure at a realistic size: at 18 KB, process spawn is 0.85 ms of a 1.05 ms
 run. A single `time cat x | json > f` measures disk writeback, not the build.

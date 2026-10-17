@@ -7,12 +7,19 @@ DIR=${DIR:-JSONTestSuite/test_parsing}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
 yfail=0 nfail=0 pass=0 idef=0
 
-# "RC NAME" per file, sorted so the report is independent of scheduling
+# "RC NAME" per file, sorted so the report is independent of scheduling. Each
+# file is read slurped and streamed; RC is X if the two disagree.
 results=$(printf '%s\0' "$DIR"/*.json |
-    xargs -0 -P "$JOBS" -I{} sh -c '"$0" < "$1" > /dev/null 2>&1; echo "$? ${1##*/}"' "$JSON" {} |
+    xargs -0 -P "$JOBS" -I{} sh -c '"$0" < "$1" > /dev/null 2>&1; a=$?
+	cat "$1" | "$0" > /dev/null 2>&1; [ $? = $a ] || a=X
+	echo "$a ${1##*/}"' "$JSON" {} |
     sort -k2)
 
 while read -r rc base; do
+	if [ "$rc" = X ]; then
+		printf 'FAIL (pipe and file disagree): %s\n' "$base"
+		yfail=$((yfail+1)); continue
+	fi
 	case "$base" in
 	y_*)
 		if [ "$rc" -eq 0 ]; then pass=$((pass+1))

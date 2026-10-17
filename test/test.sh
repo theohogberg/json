@@ -1,11 +1,12 @@
 #!/bin/sh
 # usage: JSON=binary DEPTH=cap [JOBS=n] test/test.sh
 # Minimal: each case is the only one catching some mutant (CLAUDE.md, Testing).
+# Each case runs twice, input piped (streamed) and redirected (slurped).
 
 JSON=${JSON:-out/json}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
-out=$(mktemp -d) || exit 1
-trap 'rm -rf "$out"' EXIT
+out=$(mktemp -d) && in=$(mktemp -d) || exit 1
+trap 'rm -rf "$out" "$in"' EXIT
 n=0
 
 # t NAME INPUT WANT_RC WANT_STDOUT [ARGS...]; stdout is checked only on rc 0.
@@ -17,16 +18,23 @@ t() {
 }
 
 run() {
-	name=$1 input=$2 want_rc=$3 want_out=$4
+	name=$1 input=$2 want_rc=$3 want_out=$4 f=$in/$n
 	shift 4
-	got_out=$(printf '%s' "$input" | $JSON "$@" 2>/dev/null)
-	got_rc=$?
-	if [ "$got_rc" != "$want_rc" ]; then
-		printf 'FAIL %s: rc %s, want %s\n' "$name" "$got_rc" "$want_rc"
-	elif [ "$got_rc" = 0 ] && [ "$got_out" != "$want_out" ]; then
-		printf 'FAIL %s: output\n--- got ---\n%s\n--- want ---\n%s\n' \
-		    "$name" "$got_out" "$want_out"
-	fi
+	printf '%s' "$input" > "$f"
+	for how in pipe file; do
+		if [ $how = pipe ]; then
+			got_out=$(printf '%s' "$input" | $JSON "$@" 2>/dev/null)
+		else
+			got_out=$($JSON "$@" < "$f" 2>/dev/null)
+		fi
+		got_rc=$?
+		if [ "$got_rc" != "$want_rc" ]; then
+			printf 'FAIL %s (%s): rc %s, want %s\n' "$name" $how "$got_rc" "$want_rc"
+		elif [ "$got_rc" = 0 ] && [ "$got_out" != "$want_out" ]; then
+			printf 'FAIL %s (%s): output\n--- got ---\n%s\n--- want ---\n%s\n' \
+			    "$name" $how "$got_out" "$want_out"
+		fi
+	done
 }
 
 t num-neg '-1' 0 '-1'
@@ -63,7 +71,7 @@ t err-nokey '{"a":1}' 1 '' b
 t err-oob '[1,2]' 1 '' 5
 t err-scalar '{"a":1}' 1 '' a.b
 t err-strindex '[1,2]' 1 '' x
-t err-dotdot '{"a":1}' 1 '' a..b
+t err-dotdot '{"a":1}' 1 '' a..
 
 t bad-empty '' 1 ''
 t bad-unterm-obj '{"a":1' 1 ''
@@ -115,7 +123,6 @@ t raw-alias "$A" 0 "$(printf 'hi\tthere')" --raw s
 t raw-quoted "$A" 0 '"hi\tthere"' s
 t raw-toplevel '"bare"' 0 'bare' -r
 
-t opt-rfc-stub "$A" 1 '' --rfc9535
 t opt-unknown-long "$A" 1 '' --nope
 t opt-unknown-short "$A" 1 '' -x
 t opt-two-paths "$A" 1 '' a n
@@ -134,6 +141,48 @@ t st-empty "$S" 0 '' 'a[0:0][@]'
 t st-on-scalar "$S" 1 '' 'num[@]'
 t st-unclosed "$S" 1 '' 'a[@'
 t st-traildot "$S" 1 '' 'a[@].'
+
+# [?] filters: RFC 9535's, minus match() and search()
+F='{"a":[{"name":"ada","age":36,"tags":["x"]},{"name":"bob","age":25},{"name":"c","age":40}],"min":30,"n":[["]","x"],["y"]]}'
+t flt-cmp "$F" 0 "$(printf 'ada\nc')" -r 'a[?@.age > 30].name'
+t flt-root "$F" 0 '"ada"' 'a[?@.age > $.min && @.tags].name'
+t flt-quoted "$F" 0 '"]"' 'n[@[?@ == "]"]]'
+t flt-missing "$F" 0 '' 'a[?@.nope == 1]'
+t flt-noregex "$F" 1 '' 'a[?match(@.name, "a")]'
+t flt-scalar "$F" 1 '' 'min[?@]'
+t flt-bad "$F" 1 '' 'a[?@.age >]'
+t flt-unclosed "$F" 1 '' 'a[?@.age > 1'
+
+# .. search, quoted names, unions, and [@]/[?] over object values
+D='{"id":1,"a":{"id":2,"x.y":"dot","it'"'"'s":"q","users":[{"id":3,"name":"ada","age":36},{"name":"bob","age":25}]},"m":{"u1":{"name":"cy","age":40},"u2":{"name":"di","age":20}},"arr":[10,20,30],"k]":"br"}'
+t desc-key "$D" 0 "$(printf '1\n2\n3')" '..id'
+t desc-under "$D" 0 "$(printf 'ada\nbob')" -r 'a..name'
+t desc-none "$D" 0 '' '..zzz'
+t desc-filter "$D" 0 "$(printf 'ada\ncy')" -r '..[?@.age > 30].name'
+t desc-index "$D" 0 "$(printf '{\n  "name": "bob",\n  "age": 25\n}\n30')" '..[-1]'
+t qname "$D" 0 '"dot"' "a['x.y']"
+t qname-escape "$D" 0 '"q"' "a['it\\'s']"
+t qname-bracket "$D" 0 '"br"' "['k]']"
+t qname-missing "$D" 1 '' "a['nope']"
+t union-dedupe "$D" 0 "$(printf '[\n  10,\n  20,\n  30\n]')" 'arr[0:3,1]'
+t union-order "$D" 0 "$(printf '[\n  30,\n  10\n]')" 'arr[-1,0]'
+t union-obj "$D" 0 "$(printf '{\n  "u2": {\n    "name": "di",\n    "age": 20\n  },\n  "u1": {\n    "name": "cy",\n    "age": 40\n  }\n}')" "m['u2','u1']"
+t union-oob "$D" 1 '' 'arr[0,9]'
+t union-mixed "$D" 1 '' "arr['x',0]"
+t obj-stream "$D" 0 "$(printf 'cy\ndi')" -r 'm[@.name]'
+t obj-filter "$D" 0 'cy' -r 'm[?@.age > 30].name'
+
+# RFC 9535 itself is held to the compliance suite (make jsonpath); these are
+# what it does not check
+R='{"a":[{"n":"x","v":1},{"n":"y","v":2.50},{"v":3}],"s":"hi","big":1e309}'
+t rfc-path "$R" 0 '"x"' --rfc9535 '$.a[0].n'
+t rfc-filter "$R" 0 "$(printf '2.50\n3')" --rfc9535 '$.a[?@.v > 1].v'
+t rfc-exact "$R" 0 '1e309' --rfc9535 '$[?@ < 2e309]'
+t rfc-equal "$R" 0 '"y"' --rfc9535 '$.a[?@.v == 2.5].n'
+t rfc-none "$R" 0 '' --rfc9535 '$.nope'
+t rfc-raw "$R" 0 'hi' -r --rfc9535 '$.s'
+t rfc-match "$R" 0 '"y"' --rfc9535 '$.a[?match(@.n, "[^x]")].n'
+t rfc-norootq "$R" 1 '' --rfc9535 'a'
 
 wait
 pass=0 fail=0

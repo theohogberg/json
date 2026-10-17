@@ -4,9 +4,11 @@ PREFIX ?= /usr/local
 DEPTH  ?= 1024
 RUNS   ?= 5000
 SEED   ?=
+CTS    = jsonpath-compliance-test-suite
 
 DEF    = -DMAXDEPTH=$(DEPTH)
-SAN    = -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
+# a 7-byte window makes every token straddle a refill when input is piped
+SAN    = -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -DWINDOW=7
 # the tool never frees, so the leak checker would only mask real findings
 SANENV = ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 
@@ -19,11 +21,11 @@ ifneq ($(FLAGS),$(shell cat out/.flags 2>/dev/null))
 $(shell mkdir -p out && rm -f out/json out/json.scalar out/json.asan && echo '$(FLAGS)' > out/.flags)
 endif
 
-out/json: src/json.c
+out/json: src/json.c src/unicat.h
 	$(CC) $(CFLAGS) $(DEF) -o $@ src/json.c
-out/json.scalar: src/json.c
+out/json.scalar: src/json.c src/unicat.h
 	$(CC) $(CFLAGS) $(DEF) -DNOSIMD -o $@ src/json.c
-out/json.asan: src/json.c
+out/json.asan: src/json.c src/unicat.h
 	$(CC) $(SAN) $(DEF) -o $@ src/json.c
 
 test: out/json
@@ -32,20 +34,26 @@ scalar: out/json.scalar
 	JSON=$< DEPTH=$(DEPTH) sh test/test.sh
 conformance: out/json JSONTestSuite
 	JSON=$< sh test/conformance.sh
-check: out/json.asan JSONTestSuite
+jsonpath: out/json $(CTS)
+	python3 test/jsonpath.py $< $(CTS)/cts.json
+check: out/json.asan JSONTestSuite $(CTS)
 	$(SANENV) JSON=$< DEPTH=$(DEPTH) sh test/test.sh
 	$(SANENV) JSON=$< sh test/conformance.sh
+	$(SANENV) python3 test/jsonpath.py $< $(CTS)/cts.json
 fuzz: out/json.asan
 	$(SANENV) python3 test/fuzz.py $(RUNS) $< $(SEED)
 diff: out/json out/json.scalar
 	python3 test/corpus.py > out/corpus.json
 	out/json < out/corpus.json > out/corpus.out
 	out/json.scalar < out/corpus.json | cmp - out/corpus.out
+	cat out/corpus.json | out/json | cmp - out/corpus.out
 
-ci: test scalar check fuzz conformance diff
+ci: test scalar check fuzz conformance jsonpath diff
 
 JSONTestSuite:
 	git clone --depth 1 https://github.com/nst/JSONTestSuite.git
+$(CTS):
+	git clone --depth 1 https://github.com/jsonpath-standard/$(CTS).git
 
 install: out/json
 	install -d $(DESTDIR)$(PREFIX)/bin
@@ -55,4 +63,4 @@ uninstall:
 clean:
 	rm -rf out
 
-.PHONY: all test scalar conformance check fuzz diff ci install uninstall clean
+.PHONY: all test scalar conformance jsonpath check fuzz diff ci install uninstall clean

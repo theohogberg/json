@@ -1,5 +1,10 @@
 # Design notes
 
+> Status: `--rfc9535` now implements RFC 9535 in full (section 1's dialect
+> flag, including `match`/`search`), and input is slurped or streamed by
+> `fstat` with a forward-only `swalk()` for paths (section 2's hybrid). The
+> numbers below are from before either.
+
 Three open questions for `json`: whether to follow RFC 9535, how SIMD
 intrinsics fit each way of reading input, and streaming versus reading the
 whole document. Numbers are measured on this repo at `694d744` (arm64 macOS,
