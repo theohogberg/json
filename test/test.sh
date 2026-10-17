@@ -8,12 +8,23 @@
 # go uncaught (see "Testing" in CLAUDE.md). exit 0 = all passed
 
 JSON=${JSON:-out/json}
-pass=0
-fail=0
+JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
+out=$(mktemp -d) || exit 1
+trap 'rm -rf "$out"' EXIT
+n=0
 
 # t NAME INPUT WANT_RC WANT_STDOUT [ARGS...]
 # stdout is compared only on success; a failure is checked by exit code.
+# Cases run JOBS at a time, each writing its verdict to its own numbered
+# file, which keeps the report in source order.
 t() {
+	n=$((n + 1))
+	run "$@" > "$out/$(printf '%04d' "$n")" &
+	[ $((n % JOBS)) -ne 0 ] || wait
+}
+
+# Print nothing on a pass, the reason on a failure.
+run() {
 	name=$1 input=$2 want_rc=$3 want_out=$4
 	shift 4
 	got_out=$(printf '%s' "$input" | $JSON "$@" 2>/dev/null)
@@ -23,11 +34,7 @@ t() {
 	elif [ "$got_rc" = 0 ] && [ "$got_out" != "$want_out" ]; then
 		printf 'FAIL %s: output\n--- got ---\n%s\n--- want ---\n%s\n' \
 		    "$name" "$got_out" "$want_out"
-	else
-		pass=$((pass + 1))
-		return
 	fi
-	fail=$((fail + 1))
 }
 
 # --- scalars at top level (the JSON spec allows these) ---
@@ -155,5 +162,10 @@ t st-on-scalar "$S" 1 '' 'num[@]'
 t st-unclosed "$S" 1 '' 'a[@'
 t st-traildot "$S" 1 '' 'a[@].'
 
+wait
+pass=0 fail=0
+for f in "$out"/*; do
+	if [ -s "$f" ]; then cat "$f"; fail=$((fail + 1)); else pass=$((pass + 1)); fi
+done
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

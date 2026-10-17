@@ -2,6 +2,8 @@ CC      ?= cc
 CFLAGS  ?= -std=c99 -O3 -Wall -Wextra -pedantic
 PREFIX  ?= /usr/local
 RUNS    ?= 5000
+# fuzz seed: empty picks one and prints it; set it to replay a run
+SEED    ?=
 
 # Recursion cap: ~64 bytes of stack per level. Deeper is generated, not data.
 DEPTH   ?= 1024
@@ -46,7 +48,7 @@ check-%: out/%.asan JSONTestSuite
 	$(SANENV) JSON=out/$*.asan sh test/conformance.sh
 
 fuzz-%: out/%.asan
-	$(SANENV) python3 test/fuzz.py $(RUNS) out/$*.asan
+	$(SANENV) python3 test/fuzz.py $(RUNS) out/$*.asan $(SEED)
 
 test:        $(VARIANTS:%=test-%)
 scalar:      $(VARIANTS:%=scalar-%)
@@ -75,6 +77,11 @@ uninstall:
 
 clean:
 	rm -rf out
+
+# out/x.asan and out/x.scalar are only ever built as prerequisites, which
+# makes them intermediate: make would delete them after every run and
+# rebuild them the next time. Keep them.
+.SECONDARY:
 
 # test-%/scalar-%/check-%/fuzz-% are deliberately not phony: that would stop make
 # from matching them against the pattern rules.

@@ -19,7 +19,8 @@ make check                # same suite + conformance, under ASan+UBSan
 make conformance          # JSONTestSuite (clones it on first run)
 make fuzz                 # differential fuzz vs Python's json
 make diff                 # all variants, SIMD and scalar, emit identical output
-make ci                   # everything — run this before committing
+make ci                   # everything — run this before committing (~90 s)
+make fuzz SEED=N          # replay a fuzz run; every run prints its seed
 make DEPTH=256 test       # rebuilds; the flags stamp forces it
 ```
 
@@ -218,6 +219,15 @@ a character — decide the spelling before implementing either.
   On success stdout must match; on failure only the exit code is checked.
 - `test/conformance.sh` — JSONTestSuite; `y_` must pass, `n_` must fail.
 - `test/fuzz.py` — differential against Python's `json`.
+
+All three run in parallel, one process per core (`JOBS=N` overrides it for
+the two shell scripts). That is the whole speed story: a sanitizer build
+spends ~45 ms starting up and under 1 ms on its input, no `ASAN_OPTIONS`
+setting moves that, and spawns are what every suite is made of. `fuzz.py`
+also runs each distinct input once, since a third of generated cases repeat.
+`make ci` went from ~9 minutes to ~90 s; fuzz is still most of it. Output is
+collected per case and printed in source order, so reports don't depend on
+scheduling.
 
 **The suite is minimal, and that was measured, not judged.** On 2026-10-17 it
 was reduced from 140 cases by mutation analysis: 1291 mutants of `json.c`
