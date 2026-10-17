@@ -1,5 +1,10 @@
 /* json - format JSON from stdin, optionally selecting a value; see CLAUDE.md */
+/* POSIX or Windows (_WIN32: MSVC, MinGW, clang-cl); see os_read() */
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L		/* read(2) and fstat(2): libc, not C99 */
+#elif defined(__MINGW32__)
+#define __USE_MINGW_ANSI_STDIO 1	/* %zu and %lld in old msvcrt */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -7,8 +12,18 @@
 #include <errno.h>
 #include <stdint.h>
 #include <limits.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#else
 #include <unistd.h>
 #include <sys/stat.h>
+#endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #ifndef MAXDEPTH
 #define MAXDEPTH 1024
@@ -27,6 +42,10 @@
 #define NORETURN __attribute__((noreturn))
 #define INLINE   inline __attribute__((always_inline))
 #define COLD     __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define NORETURN __declspec(noreturn)
+#define INLINE   __forceinline
+#define COLD     __declspec(noinline)
 #else
 #define NORETURN
 #define INLINE   inline
@@ -198,10 +217,14 @@ static void push(jval *c, const jstr *key, jval *item)
 #define AVX2_FN
 #define have_avx2 1
 #include <immintrin.h>
-#elif defined(__GNUC__) && !defined(NOAVX2)
+#elif (defined(__GNUC__) || defined(_MSC_VER)) && !defined(NOAVX2)
 #define SIMD_AVX2
 #define SIMD_AVX2_DISPATCH
+#if defined(__GNUC__) || defined(__clang__)	/* clang-cl too */
 #define AVX2_FN __attribute__((target("avx2")))
+#else
+#define AVX2_FN				/* MSVC takes intrinsics anywhere */
+#endif
 #include <immintrin.h>
 static int have_avx2;			/* set by simd_init() */
 #endif
@@ -214,9 +237,18 @@ static int have_avx2;			/* set by simd_init() */
 
 static void simd_init(void)
 {
-#ifdef SIMD_AVX2_DISPATCH
+#if defined(SIMD_AVX2_DISPATCH) && defined(__GNUC__)
 	__builtin_cpu_init();
 	have_avx2 = __builtin_cpu_supports("avx2") != 0;
+#elif defined(SIMD_AVX2_DISPATCH)
+	/* AVX and OSXSAVE, the OS saving YMM state, then AVX2 itself */
+	int r[4];
+
+	__cpuid(r, 1);
+	if ((r[2] & (1 << 27)) && (r[2] & (1 << 28)) && (_xgetbv(0) & 6) == 6) {
+		__cpuidex(r, 7, 0);
+		have_avx2 = (r[1] >> 5) & 1;
+	}
 #endif
 }
 
@@ -225,6 +257,11 @@ static INLINE unsigned ctz64(uint64_t m)	/* m != 0 */
 {
 #if defined(__GNUC__)
 	return (unsigned)__builtin_ctzll(m);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+	unsigned long i;
+
+	_BitScanForward64(&i, m);
+	return (unsigned)i;
 #else
 	unsigned i = 0;
 
@@ -366,7 +403,7 @@ typedef struct {
 	char *s;
 	size_t n, i, cap;
 	size_t off;		/* input offset of s[0], for messages */
-	int fd;			/* -1 once the rest of the input is in s */
+	int open;		/* 0 once the rest of the input is in s */
 	int windowed;		/* s moves, so nothing may point into it */
 	int depth;
 } P;
@@ -383,12 +420,75 @@ static NORETURN void perr(P *p, const char *msg)
 
 static void oflush(void);
 
-/* read more input, keeping s[i..n); 0 at end of input */
-static int more(P *p)
+/*
+ * The only OS-specific code: reading stdin, telling a file from a pipe, and
+ * keeping Windows from rewriting "\n" as "\r\n" on the way out.
+ */
+#ifdef _WIN32
+static void os_init(void)
+{
+	_setmode(_fileno(stdout), _O_BINARY);
+}
+
+/* bytes read into b, 0 at end of input */
+static size_t os_read(char *b, size_t n)
+{
+	DWORD got;
+
+	if (n > (size_t)1 << 30)
+		n = (size_t)1 << 30;
+	if (ReadFile(GetStdHandle(STD_INPUT_HANDLE), b, (DWORD)n, &got, NULL))
+		return got;
+	if (GetLastError() == ERROR_BROKEN_PIPE)	/* the writer is done */
+		return 0;
+	die("read: error %lu", (unsigned long)GetLastError());
+}
+
+/* stdin's size if it is a file on disk, else -1 */
+static long long os_file_size(void)
+{
+	HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+	LARGE_INTEGER sz;
+
+	if (GetFileType(h) == FILE_TYPE_DISK && GetFileSizeEx(h, &sz))
+		return sz.QuadPart;
+	return -1;
+}
+#else
+static void os_init(void)
+{
+}
+
+static size_t os_read(char *b, size_t n)
 {
 	ssize_t r;
 
-	if (p->fd < 0)
+	if (n > (size_t)1 << 30)
+		n = (size_t)1 << 30;
+	do
+		r = read(0, b, n);
+	while (r < 0 && errno == EINTR);
+	if (r < 0)
+		die("read: %s", strerror(errno));
+	return (size_t)r;
+}
+
+static long long os_file_size(void)
+{
+	struct stat st;
+
+	if (fstat(0, &st) == 0 && S_ISREG(st.st_mode))
+		return (long long)st.st_size;
+	return -1;
+}
+#endif
+
+/* read more input, keeping s[i..n); 0 at end of input */
+static int more(P *p)
+{
+	size_t r;
+
+	if (!p->open)
 		return 0;
 	if (p->i) {
 		memmove(p->s, p->s + p->i, p->n - p->i);
@@ -405,25 +505,18 @@ static int more(P *p)
 		 */
 		char c;
 
-		do
-			r = read(p->fd, &c, 1);
-		while (r < 0 && errno == EINTR);
-		if (r > 0) {
+		if ((r = os_read(&c, 1)) > 0) {
 			p->s = xrealloc(p->s, p->cap *= 2);
 			p->s[p->n] = c;
 		}
 	} else {
-		do
-			r = read(p->fd, p->s + p->n, p->cap - p->n);
-		while (r < 0 && errno == EINTR);
+		r = os_read(p->s + p->n, p->cap - p->n);
 	}
-	if (r < 0)
-		die("read: %s", strerror(errno));
 	if (r == 0) {
-		p->fd = -1;
+		p->open = 0;
 		return 0;
 	}
-	p->n += (size_t)r;
+	p->n += r;
 	return 1;
 }
 
@@ -433,15 +526,14 @@ static int more(P *p)
  * files stream through a window, so memory is bounded by the largest token
  * plus whatever the query keeps, not by the input.
  */
-static void input(P *p, int fd)
+static void input(P *p)
 {
-	struct stat st;
+	long long size = os_file_size();
 
 	memset(p, 0, sizeof *p);
-	p->fd = fd;
-	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
-	    (uintmax_t)st.st_size < SLURP_MAX) {
-		p->cap = st.st_size ? (size_t)st.st_size : 1;
+	p->open = 1;
+	if (size >= 0 && (unsigned long long)size < SLURP_MAX) {
+		p->cap = size ? (size_t)size : 1;
 		p->s = xrealloc(NULL, p->cap);
 		while (more(p))
 			;
@@ -3347,6 +3439,7 @@ int main(int argc, char **argv)
 	P p;
 
 	simd_init();
+	os_init();
 	for (i = 1; i < argc; i++) {
 		const char *a = argv[i];
 
@@ -3383,7 +3476,7 @@ int main(int argc, char **argv)
 	else if (filter)
 		whole = path_uses_root(filter);
 
-	input(&p, 0);
+	input(&p);
 	skipws(&p);
 	if (rq) {			/* any node may be compared with any other */
 		root = parse_value(&p);

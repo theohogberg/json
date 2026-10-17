@@ -1,8 +1,8 @@
 # json
 
-A zero-dependency JSON formatter and query tool for the shell. C99 plus POSIX
-`read`/`fstat`, libc only, one translation unit: `src/json.c` (which includes
-the generated `src/unicat.h`).
+A zero-dependency JSON formatter and query tool for the shell. C99, libc only
+(POSIX `read`/`fstat`, or Win32 `ReadFile`/`GetFileType` under `_WIN32`), one
+translation unit: `src/json.c` (which includes the generated `src/unicat.h`).
 
 ```
 curl -s URL | json                      # reformat
@@ -26,6 +26,11 @@ make ci                   # all of the above, ~2 min — run before committing
 make DEPTH=256 test       # flag changes rebuild; checked when make starts
 ```
 
+On Windows the same targets work from MSYS2, MinGW or Git Bash (`OS=Windows_NT`
+adds `.exe` and defaults `CC` to gcc); `check` and `fuzz` need ASan, which
+MinGW lacks. MSVC: `cl /O2 /std:c11 src\json.c /Fe:json.exe`. The Windows
+build is written but not yet verified on Windows.
+
 `make ci` must be green before any commit. Baseline: **107/107 tests, 283/283
 conformance, 713/713 JSONPath compliance (2 skipped: NUL in the selector),
 fuzz clean**.
@@ -35,8 +40,11 @@ fuzz clean**.
 Settled decisions, not preferences. Changing one needs a reason.
 
 - **No dependencies beyond libc.** No getopt_long (GNU-only), nothing
-  third-party. Option parsing is hand-rolled on purpose. POSIX `read(2)` and
-  `fstat(2)` are the only non-C99 calls (`_POSIX_C_SOURCE` at the top).
+  third-party. Option parsing is hand-rolled on purpose. The only OS calls are
+  `os_read`, `os_file_size` and `os_init`, one `#ifdef _WIN32` block: POSIX
+  `read`/`fstat` (`_POSIX_C_SOURCE` at the top) or Win32 `ReadFile`, with a
+  pipe's `ERROR_BROKEN_PIPE` as EOF and stdout set binary, since a `\r\n`
+  would break byte-identity with `jq .`.
 - **Builds clean** under `-std=c99 -O3 -Wall -Wextra -pedantic`. Fix a
   warning, don't silence it.
 - **Output is byte-identical to `jq .`** for reformatting (verified on 4.6 MB
