@@ -99,11 +99,23 @@ is 8; 16 padded every 40-byte `jval` to 48.
 variable-length copy cost 8%, and `os_` stopped inlining when the RFC code was
 added.
 
-**SIMD.** None yet. `scan_str` and `scan_ws` are the only functions intrinsics
-belong in: read only `s[0..n)`, return what the scalar loop would, fall through
-to it for the tail, and guard with `!defined(NOSIMD)`. `make scalar` and
-`make diff` then cover the fallback automatically. The old SSE2 bodies are in
-`git show 04a1c92:src/json.c`.
+**SIMD lives in `scan_str` only.** It must read only `s[0..n)`, return what
+the scalar loop would, fall through to it for the tail, and sit under
+`!defined(NOSIMD)`. Per target:
+- x86: SSE2, which every x86-64 has; SSE4.2's string instructions are slower
+  for this. AVX2 takes strings past 24 bytes when the build targets it
+  (`-mavx2`) or, with GCC/clang, when `__builtin_cpu_supports` says so at run
+  time (`simd_init()`), so one binary fits every x86-64. `-DNOAVX2` stops at
+  SSE2 (`out/json.sse2`).
+- ARM: NEON, with `vshrn` standing in for `movemask`.
+
+The first 8 bytes are a 64-bit SWAR test, not a vector: most strings are
+short keys, and NEON without it made `[@.name]` 8% *slower* than scalar.
+`scan_ws` stays scalar because a vector loop lost on both compact (1-byte
+runs) and indented input. NEON, measured: reformat −10%, long strings 2.1x,
+queries even. The x86 paths are verified under Rosetta, which runs AVX2 but
+doesn't report it, but not timed: Rosetta timings say nothing about x86
+hardware.
 
 ## Query syntax
 
@@ -218,7 +230,9 @@ output is still JSON. `--raw-output` is primary because jq also has
 `test/test.sh` (`t NAME INPUT RC OUT [ARGS...]`; stdout checked only on rc 0),
 `test/conformance.sh` (JSONTestSuite), `test/jsonpath.py` (the JSONPath
 Compliance Test Suite), `test/fuzz.py` (vs Python), and `test/corpus.py`
-(input for `make diff`). The first three run every case twice, piped
+(input for `make diff`), and `test/edges.py` (`make check`: strings and
+whitespace of every length 0-199 ending at the file's last byte). The first
+three run every case twice, piped
 (streamed) and redirected (slurped), and the ASan build uses `-DWINDOW=7` so
 `make check` puts every token across a refill. Everything runs one process per core
 (`JOBS=N` for the shell scripts): a sanitizer build spends ~45 ms starting and
@@ -242,7 +256,9 @@ large in path`, or `index ... is too large`.
 **Conformance alone is not enough.** An injected off-by-one in a vector loop
 passed every test, all conformance and byte-identical output on 4.6 MB while
 reading out of bounds; ASan caught it only with an input sized to the
-allocation edge. The arena blunts ASan further: overflowing one sub-allocation
+allocation edge. Hence `test/edges.py`, and a slurped file's buffer is exactly
+its size (`more()` probes one byte before growing a full buffer): with one
+byte of slack, a planted `i + 15 <= n` in every SIMD loop went unreported. The arena blunts ASan further: overflowing one sub-allocation
 into the next is a legal write inside a live chunk.
 
 ## Benchmarks
@@ -262,6 +278,6 @@ piped. `jq --stream` is flat at 6.2 MB.
 
 Measure at a realistic size: at 18 KB, process spawn is 0.85 ms of a 1.05 ms
 run. A single `time cat x | json > f` measures disk writeback, not the build.
-Didn't matter: `-O3` over `-O2` (+1.8%), hand unrolling, SIMD alone (+5–8%).
+Didn't matter: `-O3` over `-O2` (+1.8%), hand unrolling, vector `scan_ws`.
 Did: no tree (3x), batched output (+24% on string-heavy data), a memcpy fast
 path for escape-free strings (+18%).

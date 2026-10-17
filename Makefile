@@ -18,13 +18,16 @@ all: out/json
 # while the makefile is read, before any file is looked at
 FLAGS := $(CC) $(CFLAGS) $(DEPTH)
 ifneq ($(FLAGS),$(shell cat out/.flags 2>/dev/null))
-$(shell mkdir -p out && rm -f out/json out/json.scalar out/json.asan && echo '$(FLAGS)' > out/.flags)
+$(shell mkdir -p out && rm -f out/json out/json.scalar out/json.sse2 out/json.asan && echo '$(FLAGS)' > out/.flags)
 endif
 
 out/json: src/json.c src/unicat.h
 	$(CC) $(CFLAGS) $(DEF) -o $@ src/json.c
 out/json.scalar: src/json.c src/unicat.h
 	$(CC) $(CFLAGS) $(DEF) -DNOSIMD -o $@ src/json.c
+# on x86, SSE2 even where the CPU has AVX2; on ARM, the same NEON build
+out/json.sse2: src/json.c src/unicat.h
+	$(CC) $(CFLAGS) $(DEF) -DNOAVX2 -o $@ src/json.c
 out/json.asan: src/json.c src/unicat.h
 	$(CC) $(SAN) $(DEF) -o $@ src/json.c
 
@@ -40,12 +43,14 @@ check: out/json.asan JSONTestSuite $(CTS)
 	$(SANENV) JSON=$< DEPTH=$(DEPTH) sh test/test.sh
 	$(SANENV) JSON=$< sh test/conformance.sh
 	$(SANENV) python3 test/jsonpath.py $< $(CTS)/cts.json
+	$(SANENV) python3 test/edges.py $<
 fuzz: out/json.asan
 	$(SANENV) python3 test/fuzz.py $(RUNS) $< $(SEED)
-diff: out/json out/json.scalar
+diff: out/json out/json.scalar out/json.sse2
 	python3 test/corpus.py > out/corpus.json
 	out/json < out/corpus.json > out/corpus.out
 	out/json.scalar < out/corpus.json | cmp - out/corpus.out
+	out/json.sse2 < out/corpus.json | cmp - out/corpus.out
 	cat out/corpus.json | out/json | cmp - out/corpus.out
 
 ci: test scalar check fuzz conformance jsonpath diff

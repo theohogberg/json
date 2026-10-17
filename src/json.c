@@ -177,24 +177,176 @@ static void push(jval *c, const jstr *key, jval *item)
 }
 
 /*
- * The two hot loops, and the only place intrinsics belong. Read only s[0..n),
+ * The two hot loops, and the only place intrinsics belong (scan_ws measured
+ * faster without). Read only s[0..n),
  * return what the scalar loop would, and fall through to it for the tail.
  * Guard vector code with !defined(NOSIMD) so `make scalar` tests the fallback.
+ *
+ * x86: SSE2, which every x86-64 has; SSE4.2's string instructions are slower
+ * than this. AVX2 is used if the build targets it (-mavx2) or, with GCC or
+ * clang, if the CPU reports it at run time, so one binary fits every x86-64.
+ * -DNOAVX2 stops at SSE2. ARM: NEON, which every arm64 has. Either way the
+ * test is one compare per byte class and a mask of the first hit.
  */
+#if !defined(NOSIMD)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__SSE2__) || \
+    (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#define SIMD_SSE2
+#include <emmintrin.h>
+#if defined(__AVX2__) && !defined(NOAVX2)
+#define SIMD_AVX2
+#define AVX2_FN
+#define have_avx2 1
+#include <immintrin.h>
+#elif defined(__GNUC__) && !defined(NOAVX2)
+#define SIMD_AVX2
+#define SIMD_AVX2_DISPATCH
+#define AVX2_FN __attribute__((target("avx2")))
+#include <immintrin.h>
+static int have_avx2;			/* set by simd_init() */
+#endif
+#elif (defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)) && \
+    !defined(__ARM_BIG_ENDIAN)
+#define SIMD_NEON
+#include <arm_neon.h>
+#endif
+#endif
+
+static void simd_init(void)
+{
+#ifdef SIMD_AVX2_DISPATCH
+	__builtin_cpu_init();
+	have_avx2 = __builtin_cpu_supports("avx2") != 0;
+#endif
+}
+
+#if defined(SIMD_SSE2) || defined(SIMD_NEON)
+static INLINE unsigned ctz64(uint64_t m)	/* m != 0 */
+{
+#if defined(__GNUC__)
+	return (unsigned)__builtin_ctzll(m);
+#else
+	unsigned i = 0;
+
+	while (!(m & 1)) {
+		m >>= 1;
+		i++;
+	}
+	return i;
+#endif
+}
+#endif
+
+#ifdef SIMD_NEON
+/* one bit in four per byte of a 0x00/0xFF mask, as there is no movemask */
+static INLINE uint64_t neon_mask(uint8x16_t m)
+{
+	return vget_lane_u64(vreinterpret_u64_u8(
+		vshrn_n_u16(vreinterpretq_u16_u8(m), 4)), 0);
+}
+#endif
+
+#ifdef SIMD_AVX2
+/* scan_str 32 bytes at a time from i; the hit, or (size_t)-1 if none */
+static AVX2_FN size_t scan_str_avx2(const char *s, size_t n, size_t i)
+{
+	const __m256i q = _mm256_set1_epi8('"'), b = _mm256_set1_epi8('\\');
+	const __m256i c = _mm256_set1_epi8(0x20);
+
+	for (; i + 32 <= n; i += 32) {
+		__m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(s + i));
+		__m256i m = _mm256_or_si256(
+			_mm256_or_si256(_mm256_cmpeq_epi8(v, q), _mm256_cmpeq_epi8(v, b)),
+			_mm256_cmpgt_epi8(c, v));	/* signed: < 0x20 or >= 0x80 */
+		uint32_t bits = (uint32_t)_mm256_movemask_epi8(m);
+
+		if (bits)
+			return i + ctz64(bits);
+	}
+	return (size_t)-1;
+}
+#endif
 
 /* first quote, backslash, control or non-ASCII byte in s[0..n), else n */
-static size_t scan_str(const char *s, size_t n)
+static INLINE size_t scan_str(const char *s, size_t n)
 {
-	size_t i;
+	size_t i = 0;
 
-	for (i = 0; i < n; i++) {
-		unsigned char c = (unsigned char)s[i];
-		if (c == '"' || c == '\\' || c < 0x20 || c >= 0x80)
+#if defined(SIMD_SSE2) || defined(SIMD_NEON)
+	/*
+	 * Most strings are short keys, where setting up a vector costs more than
+	 * it saves, so the first 8 bytes are one 64-bit word: per byte, high bit
+	 * set if it is a quote or backslash (x - 1 & ~x of x ^ c), a control
+	 * byte (x - 0x20 borrows) or non-ASCII. A borrow only marks bytes above
+	 * a real hit, so the lowest mark is exact. Both targets are little-endian.
+	 */
+	if (n >= 8) {
+		const uint64_t ones = 0x0101010101010101u;
+		uint64_t x, m;
+
+		memcpy(&x, s, 8);
+		m = x ^ (ones * '"');
+		m = (m - ones) & ~m;
+		x ^= ones * '\\';
+		m |= (x - ones) & ~x;
+		x ^= ones * '\\';
+		m |= (x - ones * 0x20) | x;
+		m &= ones * 0x80;
+		if (m)
+			return ctz64(m) >> 3;
+		i = 8;
+	}
+#endif
+#if defined(SIMD_SSE2)
+	const __m128i q = _mm_set1_epi8('"'), b = _mm_set1_epi8('\\');
+	const __m128i c = _mm_set1_epi8(0x20);
+
+	for (; i + 16 <= n; i += 16) {
+		__m128i v = _mm_loadu_si128((const __m128i *)(const void *)(s + i));
+		__m128i m = _mm_or_si128(
+			_mm_or_si128(_mm_cmpeq_epi8(v, q), _mm_cmpeq_epi8(v, b)),
+			_mm_cmplt_epi8(v, c));		/* signed: < 0x20 or >= 0x80 */
+		uint32_t bits = (uint32_t)_mm_movemask_epi8(m);
+
+		if (bits)
+			return i + ctz64(bits);
+#ifdef SIMD_AVX2
+		/* past one block the string is long: go wide */
+		if (have_avx2 && i == 8 && n >= 56) {
+			size_t r = scan_str_avx2(s, n, 24);
+
+			if (r != (size_t)-1)
+				return r;
+			i = 8 + ((n - 24) & ~(size_t)31);	/* +16: past it */
+		}
+#endif
+	}
+#elif defined(SIMD_NEON)
+	const uint8x16_t q = vdupq_n_u8('"'), b = vdupq_n_u8('\\');
+	const int8x16_t c = vdupq_n_s8(0x20);
+
+	for (; i + 16 <= n; i += 16) {
+		uint8x16_t v = vld1q_u8((const uint8_t *)s + i);
+		uint8x16_t m = vorrq_u8(vorrq_u8(vceqq_u8(v, q), vceqq_u8(v, b)),
+					vcltq_s8(vreinterpretq_s8_u8(v), c));
+		uint64_t bits = neon_mask(m);
+
+		if (bits)
+			return i + (ctz64(bits) >> 2);
+	}
+#endif
+	for (; i < n; i++) {
+		unsigned char ch = (unsigned char)s[i];
+		if (ch == '"' || ch == '\\' || ch < 0x20 || ch >= 0x80)
 			break;
 	}
 	return i;
 }
 
+/*
+ * Scalar on purpose: whitespace runs are 0-1 bytes in compact input and
+ * 5-13 indented, and a vector loop was slower on both (NEON, 15-25 MB).
+ */
 static size_t scan_ws(const char *s, size_t n)
 {
 	size_t i;
@@ -244,12 +396,27 @@ static int more(P *p)
 		p->n -= p->i;
 		p->i = 0;
 	}
-	if (p->n == p->cap)			/* one token fills the window */
-		p->s = xrealloc(p->s, p->cap *= 2);
 	oflush();				/* show what we have before blocking */
-	do
-		r = read(p->fd, p->s + p->n, p->cap - p->n);
-	while (r < 0 && errno == EINTR);
+	if (p->n == p->cap) {
+		/*
+		 * Full: a slurped file, sized exactly so ASan sees a read past
+		 * its end, or one token filling the window. Grow only if a
+		 * byte is really there.
+		 */
+		char c;
+
+		do
+			r = read(p->fd, &c, 1);
+		while (r < 0 && errno == EINTR);
+		if (r > 0) {
+			p->s = xrealloc(p->s, p->cap *= 2);
+			p->s[p->n] = c;
+		}
+	} else {
+		do
+			r = read(p->fd, p->s + p->n, p->cap - p->n);
+		while (r < 0 && errno == EINTR);
+	}
 	if (r < 0)
 		die("read: %s", strerror(errno));
 	if (r == 0) {
@@ -274,7 +441,7 @@ static void input(P *p, int fd)
 	p->fd = fd;
 	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
 	    (uintmax_t)st.st_size < SLURP_MAX) {
-		p->cap = (size_t)st.st_size + 1;	/* room to see EOF */
+		p->cap = st.st_size ? (size_t)st.st_size : 1;
 		p->s = xrealloc(NULL, p->cap);
 		while (more(p))
 			;
@@ -3179,6 +3346,7 @@ int main(int argc, char **argv)
 	jval *root;
 	P p;
 
+	simd_init();
 	for (i = 1; i < argc; i++) {
 		const char *a = argv[i];
 
