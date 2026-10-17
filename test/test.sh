@@ -1,11 +1,6 @@
 #!/bin/sh
-# Regression tests. Set JSON to the binary under test and DEPTH to the
-# recursion cap it was built with.
-#
-#   JSON=out/json test/test.sh
-#
-# Minimal by construction: removing any case lets some mutant of src/json.c
-# go uncaught (see "Testing" in CLAUDE.md). exit 0 = all passed
+# usage: JSON=binary DEPTH=cap [JOBS=n] test/test.sh
+# Minimal: each case is the only one catching some mutant (CLAUDE.md, Testing).
 
 JSON=${JSON:-out/json}
 JOBS=${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
@@ -13,17 +8,14 @@ out=$(mktemp -d) || exit 1
 trap 'rm -rf "$out"' EXIT
 n=0
 
-# t NAME INPUT WANT_RC WANT_STDOUT [ARGS...]
-# stdout is compared only on success; a failure is checked by exit code.
-# Cases run JOBS at a time, each writing its verdict to its own numbered
-# file, which keeps the report in source order.
+# t NAME INPUT WANT_RC WANT_STDOUT [ARGS...]; stdout is checked only on rc 0.
+# Verdicts go to numbered files so the report stays in source order.
 t() {
 	n=$((n + 1))
 	run "$@" > "$out/$(printf '%04d' "$n")" &
 	[ $((n % JOBS)) -ne 0 ] || wait
 }
 
-# Print nothing on a pass, the reason on a failure.
 run() {
 	name=$1 input=$2 want_rc=$3 want_out=$4
 	shift 4
@@ -37,7 +29,6 @@ run() {
 	fi
 }
 
-# --- scalars at top level (the JSON spec allows these) ---
 t num-neg '-1' 0 '-1'
 t num-frac '1.50' 0 '1.50'
 t num-zero '0' 0 '0'
@@ -45,10 +36,8 @@ t lit-true 'true' 0 'true'
 t lit-false 'false' 0 'false'
 t lit-null 'null' 0 'null'
 
-# --- number fidelity: must not round-trip through double ---
 t num-tiny '1e-400' 0 '1e-400'
 
-# --- containers ---
 t obj-one '{"a":1}' 0 '{
   "a": 1
 }'
@@ -57,7 +46,6 @@ t arr-two '[1,2]' 0 '[
   2
 ]'
 
-# --- string escapes ---
 t esc-quote '"a\"b"' 0 '"a\"b"'
 t esc-backsl '"a\\b"' 0 '"a\\b"'
 t esc-newline '"a\nb"' 0 '"a\nb"'
@@ -69,17 +57,14 @@ t esc-surro '"\ud83d\ude00"' 0 '"😀"'
 t esc-lone-hi '"\ud83d"' 0 '"�"'
 t esc-lone-lo '"\udc00"' 0 '"�"'
 
-# --- path selection ---
 t path-index '[10,20,30]' 0 '20' 1
 
-# --- path errors ---
 t err-nokey '{"a":1}' 1 '' b
 t err-oob '[1,2]' 1 '' 5
 t err-scalar '{"a":1}' 1 '' a.b
 t err-strindex '[1,2]' 1 '' x
 t err-dotdot '{"a":1}' 1 '' a..b
 
-# --- malformed input must be rejected ---
 t bad-empty '' 1 ''
 t bad-unterm-obj '{"a":1' 1 ''
 t bad-unterm-str '"abc' 1 ''
@@ -95,7 +80,6 @@ t bad-badesc '"\q"' 1 ''
 t bad-shortu '"\u12"' 1 ''
 t bad-bom "$(printf '\357\273\277{}')" 1 ''
 
-# --- invalid UTF-8 must be rejected, output must always be valid JSON ---
 t bad-utf8-trunc "$(printf '"\303"')" 1 ''
 t bad-utf8-surro "$(printf '"\355\240\200"')" 1 ''
 t bad-utf8-big "$(printf '"\365\200\200\200"')" 1 ''
@@ -104,16 +88,13 @@ t ok-utf8-2byte "$(printf '"\303\245"')" 0 "$(printf '"\303\245"')"
 t ok-utf8-3byte "$(printf '"\344\270\255"')" 0 "$(printf '"\344\270\255"')"
 t ok-utf8-4byte "$(printf '"\360\237\230\200"')" 0 "$(printf '"\360\237\230\200"')"
 
-# --- depth limit, no stack smash ---
-# Derived from the configured cap rather than hard-coded, so the test
-# keeps checking the real boundary when the cap changes.
+# derived from the cap, so these keep testing the real boundary
 DEPTH=${DEPTH:-1024}
 deep=$(python3 -c "print('['*($DEPTH+1) + ']'*($DEPTH+1))")
 t deep-reject "$deep" 1 ''
 ok=$(python3 -c "print('['*$DEPTH + ']'*$DEPTH)")
 t deep-accept "$ok" 0 "$(python3 -c "d=$DEPTH; print('\n'.join(['  '*i+'[' for i in range(d-1)]+['  '*(d-1)+'[]']+['  '*i+']' for i in range(d-2,-1,-1)]))")"
 
-# --- slices: Python semantics (clamped, negative indices, steps) ---
 A='{"a":[10,20,30,40,50],"s":"hi\tthere","n":42,"o":{"x":["deep"]}}'
 t slice-clamp "$A" 0 "$(printf '[\n  10,\n  20,\n  30,\n  40,\n  50\n]')" 'a[0:99]'
 t slice-neg "$A" 0 "$(printf '[\n  40,\n  50\n]')" 'a[-2:]'
@@ -123,41 +104,33 @@ t slice-bigstep "$A" 0 "$(printf '[\n  20\n]')" 'a[1::9223372036854775807]'
 t slice-zerostep "$A" 1 '' 'a[1:2:0]'
 t slice-on-str "$A" 1 '' 's[0:1]'
 
-# --- bracket indexing, including negative ---
 t br-index "$A" 0 '10' 'a[0]'
 t br-negative "$A" 0 '50' 'a[-1]'
 t br-oob "$A" 1 '' 'a[9]'
 t br-empty "$A" 1 '' 'a[]'
 t br-malformed "$A" 1 '' 'a[1:'
 
-# --- -r / --raw-output ---
 t raw-long "$A" 0 "$(printf 'hi\tthere')" --raw-output s
 t raw-alias "$A" 0 "$(printf 'hi\tthere')" --raw s
 t raw-quoted "$A" 0 '"hi\tthere"' s
 t raw-toplevel '"bare"' 0 'bare' -r
 
-# --- option handling ---
 t opt-rfc-stub "$A" 1 '' --rfc9535
 t opt-unknown-long "$A" 1 '' --nope
 t opt-unknown-short "$A" 1 '' -x
 t opt-two-paths "$A" 1 '' a n
 
-# --- globbing with '+' (object keys only) ---
 G='{"array":[{"name":"ada","nation":"se","id":1}],"strs":["a","b"],"num":42,"deep":{"a":{"x":1},"ab":{"x":2},"b":{"x":3}}}'
 
-# globbing is only defined on objects
 t glob-on-array "$G" 1 '' 'array.n+'
 
-# a prefix pattern keeps every matching key, so the matcher must backtrack
 t glob-prefix-multi "$G" 0 "$(printf '{\n  "a": {\n    "x": 1\n  },\n  "ab": {\n    "x": 2\n  }\n}')" 'deep.a+'
 
-# --- [@] : array to stream of elements ---
 S='{"a":[{"name":"ada","nationalitie":"se","movie":1},{"name":"bob","nationalitie":"no","movie":2}],"n":[[1,2],[3,4]],"num":5,"o":{"k":1}}'
 t st-glob "$S" 0 "$(printf '{\n  "nationalitie": "se",\n  "movie": 1\n}\n{\n  "nationalitie": "no",\n  "movie": 2\n}')" 'a[@.+ie]'
 t st-nested "$S" 0 "$(printf '1\n2\n3\n4')" 'n[@][@]'
 t st-empty "$S" 0 '' 'a[0:0][@]'
 
-# [@] is defined on arrays only
 t st-on-scalar "$S" 1 '' 'num[@]'
 t st-unclosed "$S" 1 '' 'a[@'
 t st-traildot "$S" 1 '' 'a[@].'

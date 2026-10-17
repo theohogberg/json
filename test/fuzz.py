@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-"""fuzz.py - differential test of ./json against a reference JSON parser.
+"""Differential fuzz against Python's json: valid input round-trips, the
+accept/reject verdict on mutated input agrees, and path selection matches.
 
-Two properties are checked:
-
-  1. round-trip: for valid input, ./json output must parse back to a
-     semantically identical document.
-  2. agreement:  ./json must accept exactly what the reference accepts.
-                 (a parser that is too lenient is a security bug)
-
-usage: ./fuzz.py [iterations] [binary] [seed]
-
-Cases are generated up front, deduplicated, and run in parallel, one process
-per core: a sanitizer build spends ~45 ms starting up and under 1 ms on the
-input, so spawning is the whole cost. The seed is printed, and fixes the cases.
-"""
+usage: fuzz.py [iterations] [binary] [seed]   (the seed is printed; reuse it
+to replay a run)"""
 import json
 import os
 import random
@@ -69,17 +59,15 @@ def mutate(b):
     return bytes(b)
 
 
-# --- generate every case first, so the random stream depends only on SEED ---
-
-# property 1: round-trip fidelity on well-formed input
+# well-formed input must round-trip
 docs = [gen() for _ in range(N)]
 raws = [json.dumps(d, ensure_ascii=random.choice([True, False])) for d in docs]
 
-# property 2: accept/reject agreement on mutated input
+# mutated input must be accepted exactly when Python accepts it
 seeds = [json.dumps(gen()).encode() for _ in range(200)]
 muts = [mutate(random.choice(seeds)) for _ in range(N)]
 
-# property 3: path selection agrees with manual navigation
+# a top-level key must select what Python indexes
 paths = []
 for _ in range(N // 4):
     doc = gen(2)
@@ -92,8 +80,7 @@ for _ in range(N // 4):
 
 jobs = ([(r.encode(), None) for r in raws] + [(m, None) for m in muts] +
         [(json.dumps(d).encode(), k) for d, k in paths])
-# The binary is deterministic, and small generated documents repeat often
-# (a third of all cases), so each distinct input runs once.
+# spawning is the whole cost; a third of inputs repeat, so run each once
 uniq = list(dict.fromkeys(jobs))
 with ThreadPoolExecutor(os.cpu_count() or 4) as ex:
     seen = dict(zip(uniq, ex.map(lambda j: run(*j), uniq)))
@@ -123,10 +110,8 @@ for data, (rc, out) in zip(muts, r2):
     except Exception:
         ref_ok = False
     if ref_ok and rc != 0:
-        # reference accepts, we reject -> too strict
         print("TOO STRICT:", data[:120]); fails += 1
     elif not ref_ok and rc == 0:
-        # we accept, reference rejects -> too lenient (worse)
         print("TOO LENIENT:", data[:120]); fails += 1
 
 for (doc, k), (rc, out) in zip(paths, r3):

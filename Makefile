@@ -1,67 +1,46 @@
-CC      ?= cc
-CFLAGS  ?= -std=c99 -O3 -Wall -Wextra -pedantic
-PREFIX  ?= /usr/local
-RUNS    ?= 5000
-# fuzz seed: empty picks one and prints it; set it to replay a run
-SEED    ?=
+CC     ?= cc
+CFLAGS ?= -std=c99 -O3 -Wall -Wextra -pedantic
+PREFIX ?= /usr/local
+DEPTH  ?= 1024
+RUNS   ?= 5000
+SEED   ?=
 
-# Recursion cap: ~64 bytes of stack per level. Deeper is generated, not data.
-DEPTH   ?= 1024
+DEF    = -DMAXDEPTH=$(DEPTH)
+SAN    = -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
+# the tool never frees, so the leak checker would only mask real findings
+SANENV = ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 
-# The tool never frees, so the leak checker would only mask real findings.
-SANENV   = ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
-SAN      = -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
+all: out/json
 
-# every src/<name>.c is a variant
-VARIANTS = $(basename $(notdir $(wildcard src/*.c)))
-BINS     = $(VARIANTS:%=out/%)
+# make compares mtimes, not flags, and only to the second, so check the flags
+# while the makefile is read, before any file is looked at
+FLAGS := $(CC) $(CFLAGS) $(DEPTH)
+ifneq ($(FLAGS),$(shell cat out/.flags 2>/dev/null))
+$(shell mkdir -p out && rm -f out/json out/json.scalar out/json.asan && echo '$(FLAGS)' > out/.flags)
+endif
 
-all: $(BINS)
+out/json: src/json.c
+	$(CC) $(CFLAGS) $(DEF) -o $@ src/json.c
+out/json.scalar: src/json.c
+	$(CC) $(CFLAGS) $(DEF) -DNOSIMD -o $@ src/json.c
+out/json.asan: src/json.c
+	$(CC) $(SAN) $(DEF) -o $@ src/json.c
 
-# Make compares timestamps, not flags; record them so DEPTH/CFLAGS changes rebuild.
-out/.flags: FORCE
-	@mkdir -p out
-	@echo '$(CC) $(CFLAGS) $(DEPTH)' | cmp -s - $@ || echo '$(CC) $(CFLAGS) $(DEPTH)' > $@
-FORCE:
-
-out/%.asan: src/%.c out/.flags
-	$(CC) $(SAN) -DMAXDEPTH=$(DEPTH) -o $@ $<
-
-out/%: src/%.c out/.flags
-	$(CC) $(CFLAGS) -DMAXDEPTH=$(DEPTH) -o $@ $<
-
-# only one of the SIMD/scalar paths runs on a given machine; test both
-out/%.scalar: src/%.c out/.flags
-	$(CC) $(CFLAGS) -DNOSIMD -DMAXDEPTH=$(DEPTH) -o $@ $<
-
-test-%: out/%
-	JSON=out/$* DEPTH=$(DEPTH) sh test/test.sh
-
-scalar-%: out/%.scalar
-	JSON=out/$*.scalar DEPTH=$(DEPTH) sh test/test.sh
-
-conformance-%: out/% JSONTestSuite
-	JSON=out/$* sh test/conformance.sh
-
-check-%: out/%.asan JSONTestSuite
-	$(SANENV) JSON=out/$*.asan DEPTH=$(DEPTH) sh test/test.sh
-	$(SANENV) JSON=out/$*.asan sh test/conformance.sh
-
-fuzz-%: out/%.asan
-	$(SANENV) python3 test/fuzz.py $(RUNS) out/$*.asan $(SEED)
-
-test:        $(VARIANTS:%=test-%)
-scalar:      $(VARIANTS:%=scalar-%)
-conformance: $(VARIANTS:%=conformance-%)
-check:       $(VARIANTS:%=check-%)
-fuzz:        $(VARIANTS:%=fuzz-%)
-
-# every variant, SIMD or scalar, must emit identical output
-diff: $(BINS) $(BINS:=.scalar)
-	@for f in test/test.json test/test2.json; do \
-		$(firstword $(BINS)) < $$f > out/.ref; \
-		for b in $^; do $$b < $$f | cmp -s - out/.ref || { echo "DIFF $$b $$f"; exit 1; }; done; \
-	done; echo "ok $^"
+test: out/json
+	JSON=$< DEPTH=$(DEPTH) sh test/test.sh
+scalar: out/json.scalar
+	JSON=$< DEPTH=$(DEPTH) sh test/test.sh
+conformance: out/json JSONTestSuite
+	JSON=$< sh test/conformance.sh
+check: out/json.asan JSONTestSuite
+	$(SANENV) JSON=$< DEPTH=$(DEPTH) sh test/test.sh
+	$(SANENV) JSON=$< sh test/conformance.sh
+fuzz: out/json.asan
+	$(SANENV) python3 test/fuzz.py $(RUNS) $< $(SEED)
+diff: out/json out/json.scalar
+	python3 test/corpus.py > out/corpus.json
+	out/json < out/corpus.json > out/corpus.out
+	out/json.scalar < out/corpus.json | cmp - out/corpus.out
 
 ci: test scalar check fuzz conformance diff
 
@@ -71,18 +50,9 @@ JSONTestSuite:
 install: out/json
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 out/json $(DESTDIR)$(PREFIX)/bin/json
-
 uninstall:
 	rm -f $(DESTDIR)$(PREFIX)/bin/json
-
 clean:
 	rm -rf out
 
-# out/x.asan and out/x.scalar are only ever built as prerequisites, which
-# makes them intermediate: make would delete them after every run and
-# rebuild them the next time. Keep them.
-.SECONDARY:
-
-# test-%/scalar-%/check-%/fuzz-% are deliberately not phony: that would stop make
-# from matching them against the pattern rules.
-.PHONY: all test scalar conformance check fuzz diff ci install uninstall clean FORCE
+.PHONY: all test scalar conformance check fuzz diff ci install uninstall clean

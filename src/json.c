@@ -1,12 +1,4 @@
-/*
- * json - format JSON from stdin, optionally selecting a value
- *
- *   curl -s URL | json
- *   curl -s URL | json user.name
- *
- * No filter: validate and reformat in one pass, no allocation, no tree.
- * Filter: parse into a tree, walk the path, deliver results to a sink.
- */
+/* json - format JSON from stdin, optionally selecting a value; see CLAUDE.md */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -15,11 +7,11 @@
 #include <stdint.h>
 #include <limits.h>
 
-#ifndef MAXDEPTH				/* override with -DMAXDEPTH=N */
+#ifndef MAXDEPTH
 #define MAXDEPTH 1024
 #endif
 
-/* Shared helpers on the hot path must not cost a call per token. */
+/* hot-path helpers must not cost a call per token */
 #ifdef __GNUC__
 #define NORETURN __attribute__((noreturn))
 #define INLINE   inline __attribute__((always_inline))
@@ -28,7 +20,7 @@
 #define INLINE   inline
 #endif
 
-static int opt_raw;			/* -r: print strings without quotes */
+static int opt_raw;
 
 static NORETURN void die(const char *fmt, ...)
 {
@@ -52,11 +44,7 @@ static void *xrealloc(void *p, size_t n)
 
 static int isdig(int c) { return c >= '0' && c <= '9'; }
 
-/* ---------- arena ----------
- * Bump allocator. Chunks are kept and reused, so arena_restore() is O(1):
- * everything allocated since the mark is reclaimed, which bounds memory per
- * stream element. Anything built while answering a query must come from here.
- */
+/* bump allocator: kept chunks make arena_restore() O(1), and get reused */
 #define ARENA_CHUNK (1u << 20)
 
 typedef struct chunk {
@@ -89,7 +77,7 @@ static void *arena_alloc(size_t n)
 {
 	void *p;
 
-	n = (n + 7) & ~(size_t)7;		/* pointers and size_t; nothing needs more */
+	n = (n + 7) & ~(size_t)7;		/* nothing stored needs more than 8 */
 	while (!arena_cur || arena_cur->cap - arena_off < n) {
 		chunk *nx = arena_cur ? arena_cur->next : arena_head;
 
@@ -110,8 +98,6 @@ static void *arena_alloc(size_t n)
 	arena_off += n;
 	return p;
 }
-
-/* ---------- value model ---------- */
 
 typedef enum { J_NULL, J_TRUE, J_FALSE, J_NUM, J_STR, J_ARR, J_OBJ } jtype;
 
@@ -147,7 +133,7 @@ static jval *newval(jtype t)
 	return v;
 }
 
-/* Growth copies into a fresh block and abandons the old one. */
+/* growth abandons the old block: fine per query, too wasteful for the tree */
 static void *arena_grow(void *old, size_t oldn, size_t newn, size_t esz)
 {
 	void *p = arena_alloc(newn * esz);
@@ -157,7 +143,7 @@ static void *arena_grow(void *old, size_t oldn, size_t newn, size_t esz)
 	return p;
 }
 
-/* Append to an array, or to an object when key is non-NULL. */
+/* key is NULL for arrays */
 static void push(jval *c, const jstr *key, jval *item)
 {
 	if (c->u.c.n == c->u.c.cap) {
@@ -173,20 +159,13 @@ static void push(jval *c, const jstr *key, jval *item)
 	c->u.c.v[c->u.c.n++] = item;
 }
 
-/* ---------- scanners ----------
- * The two hot loops, and the only place intrinsics belong. Contract: read
- * only s[0..n), return the same answer as the scalar loop. A vector version
- * handles whole 16-byte blocks and falls through to the scalar loop for the
- * tail. Guard it so -DNOSIMD forces scalar; `make scalar` relies on that:
- *
- *   #if !defined(NOSIMD) && defined(__SSE2__)  ... #elif ... __ARM_NEON ...
+/*
+ * The two hot loops, and the only place intrinsics belong. Read only s[0..n),
+ * return what the scalar loop would, and fall through to it for the tail.
+ * Guard vector code with !defined(NOSIMD) so `make scalar` tests the fallback.
  */
 
-/*
- * First byte in s[0..n) needing attention inside a string literal: a quote,
- * a backslash, a control character, or a non-ASCII byte (UTF-8 validation).
- * Returns n if there is none.
- */
+/* first quote, backslash, control or non-ASCII byte in s[0..n), else n */
 static size_t scan_str(const char *s, size_t n)
 {
 	size_t i;
@@ -199,7 +178,6 @@ static size_t scan_str(const char *s, size_t n)
 	return i;
 }
 
-/* Length of the whitespace run at s[0..n). */
 static size_t scan_ws(const char *s, size_t n)
 {
 	size_t i;
@@ -209,8 +187,6 @@ static size_t scan_ws(const char *s, size_t n)
 			break;
 	return i;
 }
-
-/* ---------- lexer ---------- */
 
 typedef struct {
 	const char *s;
@@ -242,7 +218,6 @@ static void lit(P *p, const char *word)
 	p->i += l;
 }
 
-/* Advance past one number, validating the grammar. The lexeme stays raw. */
 static INLINE void scan_number(P *p)
 {
 	if (peek(p) == '-')
@@ -287,11 +262,7 @@ static int hex4(const char *s, size_t n, unsigned *out)
 	return 1;
 }
 
-/*
- * Validate one UTF-8 sequence at s[0..n). Returns its length, or 0 if
- * malformed: bad continuation, overlong, surrogate half, or above U+10FFFF.
- * Invalid input is rejected so the tool never emits invalid JSON.
- */
+/* length of the valid UTF-8 sequence at s[0..n), or 0 if invalid */
 static size_t utf8_check(const char *s, size_t n)
 {
 	unsigned char a = (unsigned char)s[0], b, c, d;
@@ -342,7 +313,7 @@ static size_t utf8_put(char *d, unsigned cp)
 	return 4;
 }
 
-/* str_end's out-of-line half: everything but a clean run ending in '"'. */
+/* str_end's rare cases, out of line so str_end inlines */
 static size_t str_slow(P *p, size_t end, int *esc)
 {
 	unsigned char c = end < p->n ? (unsigned char)p->s[end] : 0;
@@ -363,11 +334,7 @@ static size_t str_slow(P *p, size_t end, int *esc)
 	return end + w;
 }
 
-/*
- * Validate the string literal whose opening quote is at p->i. Returns the
- * index of the closing quote and sets *esc if any escape was seen. p->i is
- * left at the opening quote.
- */
+/* index of the closing quote, *esc if escaped; p->i stays on the opening one */
 static INLINE size_t str_end(P *p, int *esc)
 {
 	size_t end = p->i + 1;
@@ -381,10 +348,7 @@ static INLINE size_t str_end(P *p, int *esc)
 	}
 }
 
-/*
- * Decode the escape whose backslash precedes s[*j], advancing *j past it.
- * A \u surrogate pair becomes one code point; a lone surrogate, U+FFFD.
- */
+/* decode the escape whose backslash precedes s[*j]; *j moves past it */
 static unsigned unescape(P *p, size_t *j)
 {
 	const char *s = p->s + *j;
@@ -420,9 +384,6 @@ static unsigned unescape(P *p, size_t *j)
 	return cp;
 }
 
-/* ---------- output buffer ----------
- * Batch into one buffer and hand it to the kernel in big writes.
- */
 static char   obuf[1u << 16];
 static size_t olen;
 
@@ -433,7 +394,7 @@ static void oflush(void)
 	olen = 0;
 }
 
-/* om's out-of-line half, so the common case inlines: the buffer is full. */
+/* om's rare case, out of line so om inlines */
 static void om_slow(const char *s, size_t n)
 {
 	oflush();
@@ -477,7 +438,6 @@ static void indent(int lvl)
 	om(sp, (size_t)n);
 }
 
-/* One byte of string content, escaped as JSON requires. */
 static void oesc(unsigned char c)
 {
 	static const char hex[] = "0123456789abcdef";
@@ -516,8 +476,6 @@ static void print_str(const char *s, size_t len)
 	oc('"');
 }
 
-/* ---------- parser (tree) ---------- */
-
 static jstr parse_string(P *p)
 {
 	int esc;
@@ -549,16 +507,11 @@ static jstr parse_string(P *p)
 
 static jval *parse_value(P *p);
 
-/*
- * Children of every open container, innermost last. Each container copies
- * its own run into the arena at exact size when it closes, so the tree has
- * no growth slack and no abandoned blocks. Reused for the whole parse.
- */
+/* children of open containers; each closes into an exact-size arena copy */
 static jstr  *stk_k;
 static jval **stk_v;
 static size_t stk_n, stk_cap;
 
-/* Array or object, chosen by the opening byte. */
 static jval *parse_container(P *p)
 {
 	char open = p->s[p->i], close = open == '[' ? ']' : '}';
@@ -622,14 +575,12 @@ static jval *parse_value(P *p)
 			perr(p, "unexpected byte, input is not JSON");
 		scan_number(p);
 		v = newval(J_NUM);
-		v->u.num.p = p->s + start;		/* raw text: exact round-trip */
+		v->u.num.p = p->s + start;
 		v->u.num.len = p->i - start;
 	}
 	p->depth--;
 	return v;
 }
-
-/* ---------- printer (tree) ---------- */
 
 static void print_val(const jval *v, int lvl)
 {
@@ -664,10 +615,7 @@ static void print_val(const jval *v, int lvl)
 	oc(v->t == J_ARR ? ']' : '}');
 }
 
-/* ---------- streaming reformatter ----------
- * Validate and emit in one pass, allocating nothing. Output must match
- * print_val byte for byte, so escapes are decoded and re-escaped alike.
- */
+/* streaming path: no allocation, output byte-identical to print_val */
 static void emit_value(P *p, int lvl);
 
 static void emit_string(P *p)
@@ -682,7 +630,7 @@ static void emit_string(P *p)
 	oc('"');
 	if (!esc)
 		om(p->s + j, end - j);
-	while (esc) {				/* clean runs copy straight through */
+	while (esc) {
 		const char *b = memchr(p->s + j, '\\', end - j);
 		size_t run = b ? (size_t)(b - (p->s + j)) : end - j;
 		unsigned cp;
@@ -705,7 +653,6 @@ static void emit_string(P *p)
 	p->i = end + 1;
 }
 
-/* Array or object, chosen by the opening byte. */
 static void emit_container(P *p, int lvl)
 {
 	char open = p->s[p->i], close = open == '[' ? ']' : '}';
@@ -763,45 +710,34 @@ static void emit_value(P *p, int lvl)
 		if (peek(p) != '-' && !isdig(peek(p)))
 			perr(p, "unexpected byte, input is not JSON");
 		scan_number(p);
-		om(p->s + start, p->i - start);	/* the lexeme as written */
+		om(p->s + start, p->i - start);
 	}
 	p->depth--;
 }
 
-/* ---------- result sink ----------
- * A filter yields a stream, not a value: [@] makes the count a runtime
- * property, so results are delivered through a callback.
- */
 typedef void (*sink_fn)(const jval *v, void *ctx);
 
-/* Prints each value on its own line. ctx is a count of values printed. */
+/* ctx counts the values printed */
 static void print_sink(const jval *v, void *ctx)
 {
 	int *n = ctx;
 
 	if ((*n)++)
 		oc('\n');
-	/* -r applies only when the result itself is a string; nested strings
-	 * stay quoted so the output remains valid JSON. */
+	/* -r only for a string result: nested strings stay valid JSON */
 	if (opt_raw && v->t == J_STR)
 		om(v->u.str.p, v->u.str.len);
 	else
 		print_val(v, 0);
 }
 
-/* ---------- path selection ---------- */
-
-/*
- * Array slice, Python semantics: negative indices count from the end,
- * out-of-range bounds clamp, a zero step is an error. The result is one
- * sub-array, not a stream.
- */
+/* Python slice semantics; the result is one sub-array */
 typedef struct {
 	long start, end, step;
 	int has_start, has_end, has_step;
 } jslice;
 
-/* Parse an optional signed integer. Returns 1 if one was present. */
+/* optional signed integer; returns whether one was present */
 static int slice_num(const char **pp, long *out)
 {
 	const char *s = *pp;
@@ -827,14 +763,14 @@ static jval *slice_array(const jval *a, const jslice *sl)
 {
 	long n = (long)a->u.c.n;
 	long step = sl->has_step ? sl->step : 1;
-	long lo = step > 0 ? 0 : -1, hi = step > 0 ? n : n - 1;	/* valid range */
+	long lo = step > 0 ? 0 : -1, hi = step > 0 ? n : n - 1;
 	long start, end, cnt, k;
 	jval *out = newval(J_ARR);
 
 	if (step == 0)
 		die("slice step cannot be zero");
 
-	/* defaults differ by direction: a[::-1] runs from the end down */
+	/* defaults depend on direction: a[::-1] starts at the end */
 	start = sl->has_start ? sl->start : (step > 0 ? 0 : n - 1);
 	end   = sl->has_end   ? sl->end   : (step > 0 ? n : -1);
 	if (sl->has_start && start < 0) start += n;
@@ -854,8 +790,9 @@ static jval *slice_array(const jval *a, const jslice *sl)
 	return out;
 }
 
-/* Apply a bracket component. *pp points just past '['; leaves it past ']'. */
-static const jval *apply_bracket(const jval *v, const char **pp, const char *path)
+/* *pp points past '['; leaves it past ']' */
+static const jval *apply_bracket(const jval *v, const char **pp,
+				 const char *path)
 {
 	const char *b = *pp;
 	jslice sl;
@@ -890,10 +827,7 @@ static const jval *apply_bracket(const jval *v, const char **pp, const char *pat
 	return v->u.c.v[idx];
 }
 
-/*
- * '+' is the glob wildcard, not '*', so a pattern survives the shell
- * unquoted. Iterative backtracking, so many wildcards cannot blow the stack.
- */
+/* iterative, so many wildcards cannot exhaust the stack */
 static int glob_match(const char *pat, size_t pn, const char *str, size_t sn)
 {
 	size_t p = 0, s = 0, star = (size_t)-1, mark = 0;
@@ -917,10 +851,6 @@ static int glob_match(const char *pat, size_t pn, const char *str, size_t sn)
 	return p == pn;
 }
 
-/*
- * Apply one key component. A named key that is absent is an error; a glob
- * that matches nothing is an empty object.
- */
 static const jval *apply_key(const jval *v, const char *q, size_t klen)
 {
 	int glob = memchr(q, '+', klen) != NULL;
@@ -962,7 +892,6 @@ static const jval *apply_key(const jval *v, const char *q, size_t klen)
 	return v->u.c.v[idx];
 }
 
-/* Find the ']' closing the bracket at s; nested brackets are counted. */
 static const char *bracket_end(const char *s, const char *path)
 {
 	int depth = 0;
@@ -979,12 +908,7 @@ static const char *bracket_end(const char *s, const char *path)
 static void walk(const jval *v, const char *q, const char *path,
 		 sink_fn sink, void *ctx, int depth);
 
-/*
- * [@...] turns an array into a stream: the text inside the brackets plus
- * whatever follows is the path applied to each element, so a[@.x] and
- * a[@].x are the same path. Each element's allocations are reclaimed
- * before the next.
- */
+/* the bracket's contents plus the rest of the path run on each element */
 static void stream_array(const jval *v, const char *inner, size_t ilen,
 			 const char *rest, const char *path,
 			 sink_fn sink, void *ctx, int depth)
@@ -999,7 +923,7 @@ static void stream_array(const jval *v, const char *inner, size_t ilen,
 	sub = arena_alloc(ilen + rlen + 1);
 	memcpy(sub, inner, ilen);
 	memcpy(sub + ilen, rest, rlen + 1);
-	/* a lone '.' is identity at top level, but a dangling one here */
+	/* a dangling '.' is an empty component */
 	if (ilen + rlen > 0 && sub[ilen + rlen - 1] == '.')
 		die("empty component in path '%s'", path);
 
@@ -1010,14 +934,13 @@ static void stream_array(const jval *v, const char *inner, size_t ilen,
 	}
 }
 
-/* Walk a path from q, delivering every result to the sink. */
 static void walk(const jval *v, const char *q, const char *path,
 		 sink_fn sink, void *ctx, int depth)
 {
 	if (depth > MAXDEPTH)
 		die("path nesting too deep");
 
-	if (*q == '.')				/* allow both a.b and .a.b */
+	if (*q == '.')				/* a.b and .a.b */
 		q++;
 	while (*q) {
 		if (*q == '[' && q[1] == '@') {
@@ -1043,8 +966,6 @@ static void walk(const jval *v, const char *q, const char *path,
 	}
 	sink(v, ctx);
 }
-
-/* ---------- main ---------- */
 
 static char *slurp(FILE *f, size_t *outlen)
 {
@@ -1096,7 +1017,7 @@ int main(int argc, char **argv)
 			if (filter)
 				die("only one path may be given");
 			filter = a;
-		} else if (a[1] != '-') {		/* short cluster: -rh */
+		} else if (a[1] != '-') {
 			for (a++; *a; a++) {
 				if (*a == 'r')
 					opt_raw = 1;
@@ -1128,11 +1049,8 @@ int main(int argc, char **argv)
 	buf = slurp(stdin, &len);
 	p.s = buf; p.n = len; p.i = 0; p.depth = 0;
 	skipws(&p);
-	if (p.i == p.n)
-		die("empty input");
 
-	/* No filter streams, except -r on a top-level string, which must be
-	 * decoded before it can be printed bare. */
+	/* -r on a top-level string must decode it, so it takes the tree path */
 	if (filter || (opt_raw && peek(&p) == '"'))
 		root = parse_value(&p);
 	else
