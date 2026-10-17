@@ -14,15 +14,16 @@ curl -s URL | json -r users[@.name]     # stream, unquoted
 ```
 make                      # out/json
 make test                 # regression suite
+make scalar               # same suite, built -DNOSIMD (the scalar fallback)
 make check                # same suite + conformance, under ASan+UBSan
 make conformance          # JSONTestSuite (clones it on first run)
 make fuzz                 # differential fuzz vs Python's json
-make diff                 # all variants must emit identical output
+make diff                 # all variants, SIMD and scalar, emit identical output
 make ci                   # everything — run this before committing
 make DEPTH=256 test       # rebuilds; the flags stamp forces it
 ```
 
-`make ci` must be green before any commit. Current baseline: **111/111 tests,
+`make ci` must be green before any commit. Current baseline: **76/76 tests,
 283/283 conformance, fuzz clean**.
 
 The Makefile discovers variants from `src/*.c`, so dropping in a second source
@@ -61,11 +62,11 @@ Source layout (`src/json.c`, in order):
 | Section | What |
 |---|---|
 | arena | Bump allocator, linked reusable chunks, `arena_save`/`arena_restore` |
-| value model | `jval`, `jstr`, `arr_push`, `obj_push` |
+| value model | `jval` (arrays and objects share one container struct), `push` |
 | scanners | `scan_str`/`scan_ws` — the only hot loops, the SIMD seam |
 | lexer | `scan_number`, `str_end`, `unescape`, UTF-8 validation — shared by both paths |
 | output buffer | `om`/`oc`/`os_`/`oflush`, `oesc` — 64 KB, bypasses stdio |
-| parser / printer | `parse_*`, `print_val` — the filter path |
+| parser / printer | `parse_*` (scratch stack, exact-size containers), `print_val` — the filter path |
 | streaming reformatter | `emit_*`, the no-filter path |
 | path selection | `walk`, `apply_key`, `apply_bracket`, `stream_array` |
 | result sink | `sink_fn`, `print_sink` |
@@ -87,11 +88,19 @@ flag gets added: it must give `["ada"]`, not `"ada"`.
 
 `stream_array()` takes an arena mark and restores it after each element. For
 that to work, **everything built while answering a query must come from the
-arena** — which is why `arr_push`/`obj_push` use `arena_grow`, not `xrealloc`.
-The parser uses the same two functions, so the whole tree is arena-backed.
+arena** — which is why `push` uses `arena_grow`, not `xrealloc`.
 
-Verified: at 400k elements, `[@]`, `[@.name]` and `[@.+ie]` all peak at exactly
-the same RSS. 400k glob results cost zero additional memory.
+The parser does *not* use `push`. Doubling inside the arena abandons every
+outgrown block, which cost 14% more RSS than the old malloc'd tree. Instead
+children collect on a reusable scratch stack and each container is copied
+into the arena once, at exact size, when it closes. On a 12 MB file that is
+84 MB RSS against 141 MB for the old realloc tree. Arena alignment is 8, not
+16: nothing in it needs more, and 16 padded every 40-byte `jval` to 48.
+
+Verified: at 400k elements, `[@]`, `[@.name]` and `[@.+ie]` peak within
+run-to-run noise of each other (143–159 MB on macOS, where RSS varies ±5%
+between identical runs; 205–221 MB before the scratch-stack parser). 400k
+glob results cost no additional memory.
 
 If you add anything that allocates per element, allocate it from the arena.
 
@@ -99,13 +108,25 @@ If you add anything that allocates per element, allocate it from the arena.
 
 There are none yet. `scan_str` and `scan_ws` are plain scalar loops and the
 only two functions intrinsics need to touch: read only `s[0..n)`, return what
-the scalar loop would, and fall through to it for the tail. Add a
-`#if defined(__SSE2__)` / `__ARM_NEON` branch inside them. The old SSE2 bodies
-are in git history (`git show 04a1c92:src/json.c`). Keep a scalar-only CI job
-once a vector path exists, or the fallback rots.
+the scalar loop would, and fall through to it for the tail. Guard the vector
+branch with `!defined(NOSIMD) && defined(__SSE2__)` (or `__ARM_NEON`).
 
-The scalar-only refactor costs roughly 15–20% on the streaming reformat
-versus the previous scalar build; measure before and after adding intrinsics.
+`make scalar` builds with `-DNOSIMD` and runs the suite, and `make diff`
+byte-compares it against the normal build; both are in `make ci`. Today they
+are the same code, and that is the point: when a vector path lands, the
+fallback is already under test. The old SSE2 bodies are in git history
+(`git show 04a1c92:src/json.c`).
+
+### Hot-path inlining
+
+`om`, `str_end` and `scan_number` are `INLINE` (`always_inline` under GCC and
+Clang), and `om`/`str_end` keep their rare branches in out-of-line `om_slow`
+and `str_slow`. Without this, clang declines to inline them (cost 470–505
+against a threshold of 250) and short strings and small objects ran 15–25%
+slower than the code before the refactor. With it they are 9–19% faster.
+`emit_value` writes `true`/`false`/`null` with `os_` so the length is a
+constant; routing them through the variable-length number copy cost 8% on
+literal-heavy input.
 
 ## Query syntax
 
@@ -150,12 +171,14 @@ comprehension. Out-of-range index errors; out-of-range slice clamps.
 ## Flags
 
 ```
--r, --raw-output    string result without quotes or escapes (no clustering: -rr is an error)
+-r, --raw-output    string result without quotes or escapes
     --raw           alias
     --rfc9535       recognized, refuses to run (see below)
 -h, --help
 --                  end of options
 ```
+
+Short options cluster (`-rh`); long options don't take abbreviations.
 
 `-r` applies only when the result itself is a string. Strings nested inside a
 printed object stay quoted — that output still has to be valid JSON.
@@ -191,10 +214,33 @@ a character — decide the spelling before implementing either.
 
 ## Testing
 
-- `test/test.sh` — regression suite. `check NAME INPUT ARG RC OUT` for a single
-  argument, `checkf NAME INPUT RC OUT ARGS...` for flags.
+- `test/test.sh` — regression suite. One helper, `t NAME INPUT RC OUT [ARGS...]`.
+  On success stdout must match; on failure only the exit code is checked.
 - `test/conformance.sh` — JSONTestSuite; `y_` must pass, `n_` must fail.
 - `test/fuzz.py` — differential against Python's `json`.
+
+**The suite is minimal, and that was measured, not judged.** On 2026-10-17 it
+was reduced from 140 cases by mutation analysis: 1291 mutants of `json.c`
+(operator and literal swaps, ±1 on decimal and hex constants, statement
+deletion, and every `die`/`perr` site turned into a silent `exit(0)`), each
+run against every case. The kept 76 are a minimum cover: every one is the
+only case catching at least one mutant, so dropping any leaves a gap. Ties
+went to the most direct case. 813 of the 1283 that compile are caught; the
+rest are mostly equivalent (performance-only code, error-message text). An earlier by-judgement pass to 111 missed
+15 of those mutants, and removed six cases that were each the only one catching
+something, so don't prune by eye.
+
+Two blind spots shaped the operators. Error tests check only the exit code,
+so deleting a `die` just falls through to a later one that also exits 1; only
+the `exit(0)` operator tells error sites apart. And with lines carrying a
+trailing comment, or hex constants, left unmutated, all of `utf8_check` looked
+untested.
+
+Known gaps (no case reaches them): every tree-parser syntax error. All
+malformed-input cases run without a filter, so only the streaming parser's
+errors are exercised; `json a <<< '{"a" 1}'` takes a different code path from
+`json <<< '{"a" 1}'`. Also `path nesting too deep`, `number too large in path`
+and `index ... is too large`.
 
 Add a case for every behaviour change. The suite has already caught things
 conformance and 5000 fuzz cases both missed — the escape-normalization

@@ -28,8 +28,15 @@ out/%.asan: src/%.c out/.flags
 out/%: src/%.c out/.flags
 	$(CC) $(CFLAGS) -DMAXDEPTH=$(DEPTH) -o $@ $<
 
+# only one of the SIMD/scalar paths runs on a given machine; test both
+out/%.scalar: src/%.c out/.flags
+	$(CC) $(CFLAGS) -DNOSIMD -DMAXDEPTH=$(DEPTH) -o $@ $<
+
 test-%: out/%
 	JSON=out/$* DEPTH=$(DEPTH) sh test/test.sh
+
+scalar-%: out/%.scalar
+	JSON=out/$*.scalar DEPTH=$(DEPTH) sh test/test.sh
 
 conformance-%: out/% JSONTestSuite
 	JSON=out/$* sh test/conformance.sh
@@ -42,16 +49,19 @@ fuzz-%: out/%.asan
 	$(SANENV) python3 test/fuzz.py $(RUNS) out/$*.asan
 
 test:        $(VARIANTS:%=test-%)
+scalar:      $(VARIANTS:%=scalar-%)
 conformance: $(VARIANTS:%=conformance-%)
 check:       $(VARIANTS:%=check-%)
 fuzz:        $(VARIANTS:%=fuzz-%)
 
-# all variants must emit identical output
-diff: $(BINS)
-	@$(firstword $(BINS)) < test/test.json > out/.ref
-	@for b in $(BINS); do $$b < test/test.json | cmp - out/.ref && echo "ok $$b" || exit 1; done
+# every variant, SIMD or scalar, must emit identical output
+diff: $(BINS) $(BINS:=.scalar)
+	@for f in test/test.json test/test2.json; do \
+		$(firstword $(BINS)) < $$f > out/.ref; \
+		for b in $^; do $$b < $$f | cmp -s - out/.ref || { echo "DIFF $$b $$f"; exit 1; }; done; \
+	done; echo "ok $^"
 
-ci: test check fuzz conformance diff
+ci: test scalar check fuzz conformance diff
 
 JSONTestSuite:
 	git clone --depth 1 https://github.com/nst/JSONTestSuite.git
@@ -66,6 +76,6 @@ uninstall:
 clean:
 	rm -rf out
 
-# test-%/check-%/fuzz-% are deliberately not phony: that would stop make
+# test-%/scalar-%/check-%/fuzz-% are deliberately not phony: that would stop make
 # from matching them against the pattern rules.
-.PHONY: all test conformance check fuzz diff ci install uninstall clean FORCE
+.PHONY: all test scalar conformance check fuzz diff ci install uninstall clean FORCE

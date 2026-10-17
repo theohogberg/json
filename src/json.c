@@ -19,10 +19,13 @@
 #define MAXDEPTH 1024
 #endif
 
+/* Shared helpers on the hot path must not cost a call per token. */
 #ifdef __GNUC__
 #define NORETURN __attribute__((noreturn))
+#define INLINE   inline __attribute__((always_inline))
 #else
 #define NORETURN
+#define INLINE   inline
 #endif
 
 static int opt_raw;			/* -r: print strings without quotes */
@@ -86,7 +89,7 @@ static void *arena_alloc(size_t n)
 {
 	void *p;
 
-	n = (n + 15) & ~(size_t)15;		/* keep 16-byte alignment */
+	n = (n + 7) & ~(size_t)7;		/* pointers and size_t; nothing needs more */
 	while (!arena_cur || arena_cur->cap - arena_off < n) {
 		chunk *nx = arena_cur ? arena_cur->next : arena_head;
 
@@ -123,8 +126,7 @@ struct jval {
 	union {
 		struct { const char *p; size_t len; } num;	/* raw lexeme */
 		jstr str;
-		struct { jval **v; size_t n, cap; } arr;
-		struct { jstr *k; jval **v; size_t n, cap; } obj;
+		struct { jstr *k; jval **v; size_t n, cap; } c;	/* k: objects only */
 	} u;
 };
 
@@ -155,38 +157,29 @@ static void *arena_grow(void *old, size_t oldn, size_t newn, size_t esz)
 	return p;
 }
 
-static void arr_push(jval *a, jval *item)
+/* Append to an array, or to an object when key is non-NULL. */
+static void push(jval *c, const jstr *key, jval *item)
 {
-	if (a->u.arr.n == a->u.arr.cap) {
-		size_t cap = a->u.arr.cap ? a->u.arr.cap * 2 : 8;
+	if (c->u.c.n == c->u.c.cap) {
+		size_t cap = c->u.c.cap ? c->u.c.cap * 2 : 8;
 
-		a->u.arr.v = arena_grow(a->u.arr.v, a->u.arr.n, cap, sizeof *a->u.arr.v);
-		a->u.arr.cap = cap;
+		c->u.c.v = arena_grow(c->u.c.v, c->u.c.n, cap, sizeof *c->u.c.v);
+		if (key)
+			c->u.c.k = arena_grow(c->u.c.k, c->u.c.n, cap, sizeof *c->u.c.k);
+		c->u.c.cap = cap;
 	}
-	a->u.arr.v[a->u.arr.n++] = item;
-}
-
-static void obj_push(jval *o, jstr key, jval *item)
-{
-	if (o->u.obj.n == o->u.obj.cap) {
-		size_t cap = o->u.obj.cap ? o->u.obj.cap * 2 : 8;
-
-		o->u.obj.k = arena_grow(o->u.obj.k, o->u.obj.n, cap, sizeof *o->u.obj.k);
-		o->u.obj.v = arena_grow(o->u.obj.v, o->u.obj.n, cap, sizeof *o->u.obj.v);
-		o->u.obj.cap = cap;
-	}
-	o->u.obj.k[o->u.obj.n] = key;
-	o->u.obj.v[o->u.obj.n] = item;
-	o->u.obj.n++;
+	if (key)
+		c->u.c.k[c->u.c.n] = *key;
+	c->u.c.v[c->u.c.n++] = item;
 }
 
 /* ---------- scanners ----------
  * The two hot loops, and the only place intrinsics belong. Contract: read
  * only s[0..n), return the same answer as the scalar loop. A vector version
  * handles whole 16-byte blocks and falls through to the scalar loop for the
- * tail, e.g.
+ * tail. Guard it so -DNOSIMD forces scalar; `make scalar` relies on that:
  *
- *   #if defined(__SSE2__)  ... #elif defined(__ARM_NEON)  ... #endif
+ *   #if !defined(NOSIMD) && defined(__SSE2__)  ... #elif ... __ARM_NEON ...
  */
 
 /*
@@ -250,7 +243,7 @@ static void lit(P *p, const char *word)
 }
 
 /* Advance past one number, validating the grammar. The lexeme stays raw. */
-static void scan_number(P *p)
+static INLINE void scan_number(P *p)
 {
 	if (peek(p) == '-')
 		p->i++;
@@ -349,42 +342,43 @@ static size_t utf8_put(char *d, unsigned cp)
 	return 4;
 }
 
+/* str_end's out-of-line half: everything but a clean run ending in '"'. */
+static size_t str_slow(P *p, size_t end, int *esc)
+{
+	unsigned char c = end < p->n ? (unsigned char)p->s[end] : 0;
+	size_t w;
+
+	if (end >= p->n || (c == '\\' && end + 1 >= p->n))
+		perr(p, "unterminated string");
+	if (c == '\\') {
+		*esc = 1;
+		return end + 2;
+	}
+	w = c < 0x20 ? 0 : utf8_check(p->s + end, p->n - end);
+	if (w == 0) {
+		p->i = end;
+		perr(p, c < 0x20 ? "control character in string"
+				 : "invalid UTF-8 in string");
+	}
+	return end + w;
+}
+
 /*
  * Validate the string literal whose opening quote is at p->i. Returns the
  * index of the closing quote and sets *esc if any escape was seen. p->i is
  * left at the opening quote.
  */
-static size_t str_end(P *p, int *esc)
+static INLINE size_t str_end(P *p, int *esc)
 {
 	size_t end = p->i + 1;
 
 	*esc = 0;
-	while (end < p->n) {
-		unsigned char c;
-
+	for (;;) {
 		end += scan_str(p->s + end, p->n - end);
-		if (end == p->n)
-			break;
-		c = (unsigned char)p->s[end];
-		if (c == '"')
+		if (end < p->n && p->s[end] == '"')
 			return end;
-		if (c == '\\') {
-			*esc = 1;
-			end += 2;
-		} else if (c < 0x20) {
-			p->i = end;
-			perr(p, "control character in string");
-		} else {
-			size_t w = utf8_check(p->s + end, p->n - end);
-
-			if (w == 0) {
-				p->i = end;
-				perr(p, "invalid UTF-8 in string");
-			}
-			end += w;
-		}
+		end = str_slow(p, end, esc);
 	}
-	perr(p, "unterminated string");
 }
 
 /*
@@ -439,16 +433,25 @@ static void oflush(void)
 	olen = 0;
 }
 
-static void om(const char *s, size_t n)
+/* om's out-of-line half, so the common case inlines: the buffer is full. */
+static void om_slow(const char *s, size_t n)
 {
+	oflush();
 	if (n >= sizeof obuf) {
-		oflush();
 		if (fwrite(s, 1, n, stdout) != n)
 			die("write error: %s", strerror(errno));
 		return;
 	}
-	if (olen + n > sizeof obuf)
-		oflush();
+	memcpy(obuf, s, n);
+	olen = n;
+}
+
+static INLINE void om(const char *s, size_t n)
+{
+	if (olen + n > sizeof obuf) {
+		om_slow(s, n);
+		return;
+	}
 	memcpy(obuf + olen, s, n);
 	olen += n;
 }
@@ -546,17 +549,28 @@ static jstr parse_string(P *p)
 
 static jval *parse_value(P *p);
 
+/*
+ * Children of every open container, innermost last. Each container copies
+ * its own run into the arena at exact size when it closes, so the tree has
+ * no growth slack and no abandoned blocks. Reused for the whole parse.
+ */
+static jstr  *stk_k;
+static jval **stk_v;
+static size_t stk_n, stk_cap;
+
 /* Array or object, chosen by the opening byte. */
 static jval *parse_container(P *p)
 {
 	char open = p->s[p->i], close = open == '[' ? ']' : '}';
 	jval *v = newval(open == '[' ? J_ARR : J_OBJ);
+	size_t base = stk_n, n;
 
 	p->i++;
 	skipws(p);
 	if (peek(p) == close) { p->i++; return v; }
 	for (;;) {
 		jstr k = { NULL, 0 };
+		jval *item;
 
 		if (open == '{') {
 			k = parse_string(p);
@@ -565,15 +579,26 @@ static jval *parse_container(P *p)
 				perr(p, "expected ':'");
 			p->i++;
 		}
-		if (open == '[')
-			arr_push(v, parse_value(p));
-		else
-			obj_push(v, k, parse_value(p));
+		item = parse_value(p);
+		if (stk_n == stk_cap) {
+			stk_cap = stk_cap ? stk_cap * 2 : 256;
+			stk_k = xrealloc(stk_k, stk_cap * sizeof *stk_k);
+			stk_v = xrealloc(stk_v, stk_cap * sizeof *stk_v);
+		}
+		stk_k[stk_n] = k;
+		stk_v[stk_n++] = item;
 		skipws(p);
 		if (peek(p) == ',') { p->i++; skipws(p); continue; }
-		if (peek(p) == close) { p->i++; return v; }
-		perr(p, "expected ',' or closing bracket");
+		if (peek(p) == close) { p->i++; break; }
+		perr(p, close == ']' ? "expected ',' or ']'" : "expected ',' or '}'");
 	}
+	n = stk_n - base;
+	stk_n = base;
+	v->u.c.v = arena_grow(stk_v + base, n, n, sizeof *stk_v);
+	if (open == '{')
+		v->u.c.k = arena_grow(stk_k + base, n, n, sizeof *stk_k);
+	v->u.c.n = v->u.c.cap = n;
+	return v;
 }
 
 static jval *parse_value(P *p)
@@ -619,7 +644,7 @@ static void print_val(const jval *v, int lvl)
 	case J_ARR:
 	case J_OBJ:   break;
 	}
-	n = v->t == J_ARR ? v->u.arr.n : v->u.obj.n;
+	n = v->u.c.n;
 	oc(v->t == J_ARR ? '[' : '{');
 	for (i = 0; i < n; i++) {
 		if (i)
@@ -627,12 +652,10 @@ static void print_val(const jval *v, int lvl)
 		oc('\n');
 		indent(lvl + 1);
 		if (v->t == J_OBJ) {
-			print_str(v->u.obj.k[i].p, v->u.obj.k[i].len);
+			print_str(v->u.c.k[i].p, v->u.c.k[i].len);
 			os_(": ");
-			print_val(v->u.obj.v[i], lvl + 1);
-		} else {
-			print_val(v->u.arr.v[i], lvl + 1);
 		}
+		print_val(v->u.c.v[i], lvl + 1);
 	}
 	if (n) {
 		oc('\n');
@@ -714,7 +737,7 @@ static void emit_container(P *p, int lvl)
 		skipws(p);
 		if (peek(p) == ',') { p->i++; skipws(p); continue; }
 		if (peek(p) == close) { p->i++; break; }
-		perr(p, "expected ',' or closing bracket");
+		perr(p, close == ']' ? "expected ',' or ']'" : "expected ',' or '}'");
 	}
 	oc('\n');
 	indent(lvl);
@@ -724,26 +747,24 @@ static void emit_container(P *p, int lvl)
 static void emit_value(P *p, int lvl)
 {
 	size_t start;
-	int raw = 1;				/* echo the lexeme as written */
 
 	if (++p->depth > MAXDEPTH)
 		perr(p, "nesting too deep");
 	skipws(p);
-	start = p->i;
 	switch (peek(p)) {
-	case '{': case '[': emit_container(p, lvl); raw = 0; break;
-	case '"': emit_string(p); raw = 0; break;
-	case 't': lit(p, "true");  break;
-	case 'f': lit(p, "false"); break;
-	case 'n': lit(p, "null");  break;
+	case '{': case '[': emit_container(p, lvl); break;
+	case '"': emit_string(p); break;
+	case 't': lit(p, "true");  os_("true");  break;
+	case 'f': lit(p, "false"); os_("false"); break;
+	case 'n': lit(p, "null");  os_("null");  break;
 	case -1:  perr(p, "unexpected end of input");
 	default:
+		start = p->i;
 		if (peek(p) != '-' && !isdig(peek(p)))
 			perr(p, "unexpected byte, input is not JSON");
 		scan_number(p);
+		om(p->s + start, p->i - start);	/* the lexeme as written */
 	}
-	if (raw)
-		om(p->s + start, p->i - start);
 	p->depth--;
 }
 
@@ -804,10 +825,10 @@ static int slice_num(const char **pp, long *out)
 
 static jval *slice_array(const jval *a, const jslice *sl)
 {
-	long n = (long)a->u.arr.n;
+	long n = (long)a->u.c.n;
 	long step = sl->has_step ? sl->step : 1;
 	long lo = step > 0 ? 0 : -1, hi = step > 0 ? n : n - 1;	/* valid range */
-	long start, end, i;
+	long start, end, cnt, k;
 	jval *out = newval(J_ARR);
 
 	if (step == 0)
@@ -821,8 +842,15 @@ static jval *slice_array(const jval *a, const jslice *sl)
 	start = start < lo ? lo : start > hi ? hi : start;
 	end   = end   < lo ? lo : end   > hi ? hi : end;
 
-	for (i = start; step > 0 ? i < end : i > end; i += step)
-		arr_push(out, a->u.arr.v[i]);
+	/* count first: stepping i past end could overflow for a huge step */
+	if (step > 0)
+		cnt = start < end ? (end - start - 1) / step + 1 : 0;
+	else
+		cnt = start > end ? (start - end - 1) / -step + 1 : 0;
+	out->u.c.v = arena_alloc((size_t)cnt * sizeof *out->u.c.v);
+	for (k = 0; k < cnt; k++)
+		out->u.c.v[k] = a->u.c.v[start + k * step];
+	out->u.c.n = out->u.c.cap = (size_t)cnt;
 	return out;
 }
 
@@ -856,10 +884,10 @@ static const jval *apply_bracket(const jval *v, const char **pp, const char *pat
 	if (is_slice)
 		return slice_array(v, &sl);
 
-	idx = sl.start < 0 ? sl.start + (long)v->u.arr.n : sl.start;
-	if (idx < 0 || idx >= (long)v->u.arr.n)
-		die("index %ld out of range (total: %zu)", sl.start, v->u.arr.n);
-	return v->u.arr.v[idx];
+	idx = sl.start < 0 ? sl.start + (long)v->u.c.n : sl.start;
+	if (idx < 0 || idx >= (long)v->u.c.n)
+		die("index %ld out of range (total: %zu)", sl.start, v->u.c.n);
+	return v->u.c.v[idx];
 }
 
 /*
@@ -901,16 +929,16 @@ static const jval *apply_key(const jval *v, const char *q, size_t klen)
 	if (v->t == J_OBJ && glob) {
 		jval *out = newval(J_OBJ);
 
-		for (i = 0; i < v->u.obj.n; i++)
-			if (glob_match(q, klen, v->u.obj.k[i].p, v->u.obj.k[i].len))
-				obj_push(out, v->u.obj.k[i], v->u.obj.v[i]);
+		for (i = 0; i < v->u.c.n; i++)
+			if (glob_match(q, klen, v->u.c.k[i].p, v->u.c.k[i].len))
+				push(out, &v->u.c.k[i], v->u.c.v[i]);
 		return out;
 	}
 	if (v->t == J_OBJ) {
-		for (i = 0; i < v->u.obj.n; i++)
-			if (v->u.obj.k[i].len == klen &&
-			    memcmp(v->u.obj.k[i].p, q, klen) == 0)
-				return v->u.obj.v[i];
+		for (i = 0; i < v->u.c.n; i++)
+			if (v->u.c.k[i].len == klen &&
+			    memcmp(v->u.c.k[i].p, q, klen) == 0)
+				return v->u.c.v[i];
 		die("no such key: %.*s", (int)klen, q);
 	}
 	if (glob)
@@ -929,9 +957,9 @@ static const jval *apply_key(const jval *v, const char *q, size_t klen)
 			die("index '%.*s' is too large", (int)klen, q);
 		idx = idx * 10 + d;
 	}
-	if (idx >= v->u.arr.n)
-		die("index %zu out of range (total: %zu)", idx, v->u.arr.n);
-	return v->u.arr.v[idx];
+	if (idx >= v->u.c.n)
+		die("index %zu out of range (total: %zu)", idx, v->u.c.n);
+	return v->u.c.v[idx];
 }
 
 /* Find the ']' closing the bracket at s; nested brackets are counted. */
@@ -976,8 +1004,8 @@ static void stream_array(const jval *v, const char *inner, size_t ilen,
 		die("empty component in path '%s'", path);
 
 	m = arena_save();			/* after sub, which must survive */
-	for (i = 0; i < v->u.arr.n; i++) {
-		walk(v->u.arr.v[i], sub, path, sink, ctx, depth + 1);
+	for (i = 0; i < v->u.c.n; i++) {
+		walk(v->u.c.v[i], sub, path, sink, ctx, depth + 1);
 		arena_restore(m);
 	}
 }
@@ -1068,13 +1096,23 @@ int main(int argc, char **argv)
 			if (filter)
 				die("only one path may be given");
 			filter = a;
+		} else if (a[1] != '-') {		/* short cluster: -rh */
+			for (a++; *a; a++) {
+				if (*a == 'r')
+					opt_raw = 1;
+				else if (*a == 'h') {
+					usage();
+					return 0;
+				}
+				else
+					die("unknown option '-%c' (try --help)", *a);
+			}
 		} else if (strcmp(a, "--") == 0) {
 			endopts = 1;
-		} else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
+		} else if (strcmp(a, "--help") == 0) {
 			usage();
 			return 0;
-		} else if (strcmp(a, "-r") == 0 || strcmp(a, "--raw") == 0 ||
-			   strcmp(a, "--raw-output") == 0) {
+		} else if (strcmp(a, "--raw") == 0 || strcmp(a, "--raw-output") == 0) {
 			opt_raw = 1;
 		} else if (strcmp(a, "--rfc9535") == 0) {
 			rfc = 1;

@@ -4,221 +4,156 @@
 #
 #   JSON=out/json test/test.sh
 #
-# exit 0 = all passed
+# Minimal by construction: removing any case lets some mutant of src/json.c
+# go uncaught (see "Testing" in CLAUDE.md). exit 0 = all passed
 
 JSON=${JSON:-out/json}
 pass=0
 fail=0
 
-# check NAME INPUT ARG EXPECTED_RC EXPECTED_STDOUT
-check() {
-	name=$1 input=$2 arg=$3 want_rc=$4 want_out=$5
-	if [ -n "$arg" ]; then
-		got_out=$(printf '%s' "$input" | $JSON "$arg" 2>/dev/null)
-	else
-		got_out=$(printf '%s' "$input" | $JSON 2>/dev/null)
-	fi
-	got_rc=$?
-	if [ "$got_rc" != "$want_rc" ]; then
-		printf 'FAIL %s: rc %s, want %s\n' "$name" "$got_rc" "$want_rc"
-		fail=$((fail + 1))
-		return
-	fi
-	if [ "$got_rc" = 0 ] && [ "$got_out" != "$want_out" ]; then
-		printf 'FAIL %s: output\n--- got ---\n%s\n--- want ---\n%s\n' \
-		    "$name" "$got_out" "$want_out"
-		fail=$((fail + 1))
-		return
-	fi
-	pass=$((pass + 1))
-}
-
-# checkf NAME INPUT WANT_RC WANT_OUT [ARGS...]  -- like check, but any
-# number of command-line arguments, so flags can be tested.
-checkf() {
+# t NAME INPUT WANT_RC WANT_STDOUT [ARGS...]
+# stdout is compared only on success; a failure is checked by exit code.
+t() {
 	name=$1 input=$2 want_rc=$3 want_out=$4
 	shift 4
 	got_out=$(printf '%s' "$input" | $JSON "$@" 2>/dev/null)
 	got_rc=$?
 	if [ "$got_rc" != "$want_rc" ]; then
 		printf 'FAIL %s: rc %s, want %s\n' "$name" "$got_rc" "$want_rc"
-		fail=$((fail + 1))
-		return
-	fi
-	if [ "$got_rc" = 0 ] && [ "$got_out" != "$want_out" ]; then
+	elif [ "$got_rc" = 0 ] && [ "$got_out" != "$want_out" ]; then
 		printf 'FAIL %s: output\n--- got ---\n%s\n--- want ---\n%s\n' \
 		    "$name" "$got_out" "$want_out"
-		fail=$((fail + 1))
+	else
+		pass=$((pass + 1))
 		return
 	fi
-	pass=$((pass + 1))
+	fail=$((fail + 1))
 }
 
 # --- scalars at top level (the JSON spec allows these) ---
-check num-int      '42'        '' 0 '42'
-check num-neg      '-1'        '' 0 '-1'
-check num-exp      '1e10'      '' 0 '1e10'
-check num-frac     '1.50'      '' 0 '1.50'
-check num-zero     '0'         '' 0 '0'
-check lit-true     'true'      '' 0 'true'
-check lit-false    'false'     '' 0 'false'
-check lit-null     'null'      '' 0 'null'
-check str-plain    '"hi"'      '' 0 '"hi"'
-check str-empty    '""'        '' 0 '""'
+t num-neg '-1' 0 '-1'
+t num-frac '1.50' 0 '1.50'
+t num-zero '0' 0 '0'
+t lit-true 'true' 0 'true'
+t lit-false 'false' 0 'false'
+t lit-null 'null' 0 'null'
 
 # --- number fidelity: must not round-trip through double ---
-check num-bigint   '100000000000000000001' '' 0 '100000000000000000001'
-check num-huge     '1e309'                 '' 0 '1e309'
+t num-tiny '1e-400' 0 '1e-400'
 
 # --- containers ---
-check obj-empty    '{}'        '' 0 '{}'
-check arr-empty    '[]'        '' 0 '[]'
-check arr-nested   '[[]]'      '' 0 '[
-  []
-]'
-check obj-one      '{"a":1}'   '' 0 '{
+t obj-one '{"a":1}' 0 '{
   "a": 1
 }'
-check arr-two      '[1,2]'     '' 0 '[
+t arr-two '[1,2]' 0 '[
   1,
   2
 ]'
 
 # --- string escapes ---
-check esc-quote    '"a\"b"'         '' 0 '"a\"b"'
-check esc-backsl   '"a\\b"'         '' 0 '"a\\b"'
-check esc-newline  '"a\nb"'         '' 0 '"a\nb"'
-check esc-tab      '"a\tb"'         '' 0 '"a\tb"'
-check esc-slash    '"a\/b"'         '' 0 '"a/b"'
-check esc-ctrl     '"\u0001"'       '' 0 '"\u0001"'
-check esc-nul      '"\u0000"'       '' 0 '"\u0000"'
-check esc-latin    '"\u00e5"'       '' 0 '"å"'
-check esc-cjk      '"\u4e2d"'       '' 0 '"中"'
-check esc-surro    '"\ud83d\ude00"' '' 0 '"😀"'
-check esc-lone-hi  '"\ud83d"'       '' 0 '"�"'
-check esc-lone-lo  '"\udc00"'       '' 0 '"�"'
+t esc-quote '"a\"b"' 0 '"a\"b"'
+t esc-backsl '"a\\b"' 0 '"a\\b"'
+t esc-newline '"a\nb"' 0 '"a\nb"'
+t esc-slash '"a\/b"' 0 '"a/b"'
+t esc-ctrl '"\u0001"' 0 '"\u0001"'
+t esc-latin '"\u00e5"' 0 '"å"'
+t esc-cjk '"\u4e2d"' 0 '"中"'
+t esc-surro '"\ud83d\ude00"' 0 '"😀"'
+t esc-lone-hi '"\ud83d"' 0 '"�"'
+t esc-lone-lo '"\udc00"' 0 '"�"'
 
 # --- path selection ---
-check path-dotted  '{"a":{"b":2}}'            a.b     0 '2'
-check path-leaddot '{"a":{"b":2}}'            .a.b    0 '2'
-check path-index   '[10,20,30]'               1       0 '20'
-check path-mixed   '{"a":[{"b":9}]}'          a.0.b   0 '9'
-check path-obj-out '{"a":{"b":2}}'            a       0 '{
-  "b": 2
-}'
-check path-key-num '{"0":"x"}'                0       0 '"x"'
-check path-empty   '{"":1}'                   ''      0 '{
-  "": 1
-}'
+t path-index '[10,20,30]' 0 '20' 1
 
 # --- path errors ---
-check err-nokey    '{"a":1}'      b        1 ''
-check err-oob      '[1,2]'        5        1 ''
-check err-scalar   '{"a":1}'      a.b      1 ''
-check err-strindex '[1,2]'        x        1 ''
-check err-dotdot   '{"a":1}'      a..b     1 ''
+t err-nokey '{"a":1}' 1 '' b
+t err-oob '[1,2]' 1 '' 5
+t err-scalar '{"a":1}' 1 '' a.b
+t err-strindex '[1,2]' 1 '' x
+t err-dotdot '{"a":1}' 1 '' a..b
 
 # --- malformed input must be rejected ---
-check bad-empty      ''                 '' 1 ''
-check bad-trail      '{"a":1} x'        '' 1 ''
-check bad-comma      '{"a":1,}'         '' 1 ''
-check bad-arr-comma  '[1,]'             '' 1 ''
-check bad-unterm-obj '{"a":1'           '' 1 ''
-check bad-unterm-str '"abc'             '' 1 ''
-check bad-nokey      '{a:1}'            '' 1 ''
-check bad-nocolon    '{"a" 1}'          '' 1 ''
-check bad-leadzero   '01'               '' 1 ''
-check bad-dot-trail  '5.'               '' 1 ''
-check bad-exp-empty  '1e'               '' 1 ''
-check bad-bare-minus '-'                '' 1 ''
-check bad-tru        'tru'              '' 1 ''
-check bad-rawctrl    "$(printf '"a\tb"')" '' 1 ''
-check bad-badesc     '"\q"'             '' 1 ''
-check bad-shortu     '"\u12"'           '' 1 ''
-check bad-bom        "$(printf '\357\273\277{}')" '' 1 ''
+t bad-empty '' 1 ''
+t bad-unterm-obj '{"a":1' 1 ''
+t bad-unterm-str '"abc' 1 ''
+t bad-nokey '{a:1}' 1 ''
+t bad-nocolon '{"a" 1}' 1 ''
+t bad-leadzero '01' 1 ''
+t bad-dot-trail '5.' 1 ''
+t bad-exp-empty '1e' 1 ''
+t bad-bare-minus '-' 1 ''
+t bad-tru 'tru' 1 ''
+t bad-rawctrl "$(printf '"a\tb"')" 1 ''
+t bad-badesc '"\q"' 1 ''
+t bad-shortu '"\u12"' 1 ''
+t bad-bom "$(printf '\357\273\277{}')" 1 ''
 
 # --- invalid UTF-8 must be rejected, output must always be valid JSON ---
-check bad-utf8-lone   "$(printf '"a\377b"')"      '' 1 ''
-check bad-utf8-trunc  "$(printf '"\303"')"        '' 1 ''
-check bad-utf8-surro  "$(printf '"\355\240\200"')" '' 1 ''
-check ok-utf8-2byte   "$(printf '"\303\245"')"          '' 0 "$(printf '"\303\245"')"
-check ok-utf8-3byte   "$(printf '"\344\270\255"')"     '' 0 "$(printf '"\344\270\255"')"
-check ok-utf8-4byte   "$(printf '"\360\237\230\200"')" '' 0 "$(printf '"\360\237\230\200"')"
+t bad-utf8-trunc "$(printf '"\303"')" 1 ''
+t bad-utf8-surro "$(printf '"\355\240\200"')" 1 ''
+t bad-utf8-big "$(printf '"\365\200\200\200"')" 1 ''
+t bad-utf8-cont "$(printf '"\200"')" 1 ''
+t ok-utf8-2byte "$(printf '"\303\245"')" 0 "$(printf '"\303\245"')"
+t ok-utf8-3byte "$(printf '"\344\270\255"')" 0 "$(printf '"\344\270\255"')"
+t ok-utf8-4byte "$(printf '"\360\237\230\200"')" 0 "$(printf '"\360\237\230\200"')"
 
 # --- depth limit, no stack smash ---
 # Derived from the configured cap rather than hard-coded, so the test
 # keeps checking the real boundary when the cap changes.
 DEPTH=${DEPTH:-1024}
 deep=$(python3 -c "print('['*($DEPTH+1) + ']'*($DEPTH+1))")
-check deep-reject "$deep" '' 1 ''
+t deep-reject "$deep" 1 ''
 ok=$(python3 -c "print('['*$DEPTH + ']'*$DEPTH)")
-check deep-accept "$ok" '' 0 "$(printf '%s' "$ok" | $JSON)"
+t deep-accept "$ok" 0 "$(python3 -c "d=$DEPTH; print('\n'.join(['  '*i+'[' for i in range(d-1)]+['  '*(d-1)+'[]']+['  '*i+']' for i in range(d-2,-1,-1)]))")"
 
 # --- slices: Python semantics (clamped, negative indices, steps) ---
 A='{"a":[10,20,30,40,50],"s":"hi\tthere","n":42,"o":{"x":["deep"]}}'
-check slice-basic   "$A" 'a[1:3]'   0 "$(printf '[\n  20,\n  30\n]')"
-check slice-clamp   "$A" 'a[0:99]'  0 "$(printf '[\n  10,\n  20,\n  30,\n  40,\n  50\n]')"
-check slice-neg     "$A" 'a[-2:]'   0 "$(printf '[\n  40,\n  50\n]')"
-check slice-open    "$A" 'a[:2]'    0 "$(printf '[\n  10,\n  20\n]')"
-check slice-step    "$A" 'a[::2]'   0 "$(printf '[\n  10,\n  30,\n  50\n]')"
-check slice-rev     "$A" 'a[::-1]'  0 "$(printf '[\n  50,\n  40,\n  30,\n  20,\n  10\n]')"
-check slice-empty   "$A" 'a[3:1]'   0 '[]'
-check slice-zerostep "$A" 'a[1:2:0]' 1 ''
-check slice-on-str  "$A" 's[0:1]'   1 ''
+t slice-clamp "$A" 0 "$(printf '[\n  10,\n  20,\n  30,\n  40,\n  50\n]')" 'a[0:99]'
+t slice-neg "$A" 0 "$(printf '[\n  40,\n  50\n]')" 'a[-2:]'
+t slice-open "$A" 0 "$(printf '[\n  10,\n  20\n]')" 'a[:2]'
+t slice-rev "$A" 0 "$(printf '[\n  50,\n  40,\n  30,\n  20,\n  10\n]')" 'a[::-1]'
+t slice-bigstep "$A" 0 "$(printf '[\n  20\n]')" 'a[1::9223372036854775807]'
+t slice-zerostep "$A" 1 '' 'a[1:2:0]'
+t slice-on-str "$A" 1 '' 's[0:1]'
 
 # --- bracket indexing, including negative ---
-check br-negative   "$A" 'a[-1]'    0 '50'
-check br-oob        "$A" 'a[9]'     1 ''
-check br-empty      "$A" 'a[]'      1 ''
-check br-malformed  "$A" 'a[1:'     1 ''
-check br-mixed      "$A" 'a[1:3].0' 0 '20'
-check br-after-key  "$A" 'o.x[0]'   0 '"deep"'
+t br-index "$A" 0 '10' 'a[0]'
+t br-negative "$A" 0 '50' 'a[-1]'
+t br-oob "$A" 1 '' 'a[9]'
+t br-empty "$A" 1 '' 'a[]'
+t br-malformed "$A" 1 '' 'a[1:'
 
 # --- -r / --raw-output ---
-checkf raw-short    "$A" 0 "$(printf 'hi\tthere')" -r s
-checkf raw-long     "$A" 0 "$(printf 'hi\tthere')" --raw-output s
-checkf raw-alias    "$A" 0 "$(printf 'hi\tthere')" --raw s
-checkf raw-quoted   "$A" 0 '"hi\tthere"'           s
-checkf raw-number   "$A" 0 '42'                    -r n
-checkf raw-toplevel '"bare"' 0 'bare'              -r
-checkf raw-noop     '{"k":1}' 0 "$(printf '{\n  "k": 1\n}')" -r
+t raw-long "$A" 0 "$(printf 'hi\tthere')" --raw-output s
+t raw-alias "$A" 0 "$(printf 'hi\tthere')" --raw s
+t raw-quoted "$A" 0 '"hi\tthere"' s
+t raw-toplevel '"bare"' 0 'bare' -r
 
 # --- option handling ---
-checkf opt-rfc-stub "$A" 1 '' --rfc9535
-checkf opt-unknown  "$A" 1 '' --nope
-checkf opt-two-paths "$A" 1 '' a n
+t opt-rfc-stub "$A" 1 '' --rfc9535
+t opt-unknown-long "$A" 1 '' --nope
+t opt-unknown-short "$A" 1 '' -x
+t opt-two-paths "$A" 1 '' a n
 
 # --- globbing with '+' (object keys only) ---
 G='{"array":[{"name":"ada","nation":"se","id":1}],"strs":["a","b"],"num":42,"deep":{"a":{"x":1},"ab":{"x":2},"b":{"x":3}}}'
-check glob-prefix    "$G" 'array[0].na+' 0 "$(printf '{\n  "name": "ada",\n  "nation": "se"\n}')"
-check glob-suffix    "$G" 'deep.+b'      0 "$(printf '{\n  "ab": {\n    "x": 2\n  },\n  "b": {\n    "x": 3\n  }\n}')"
-check glob-all       "$G" 'deep.+'       0 "$(printf '{\n  "a": {\n    "x": 1\n  },\n  "ab": {\n    "x": 2\n  },\n  "b": {\n    "x": 3\n  }\n}')"
-check glob-middle    "$G" 'array[0].n+n' 0 "$(printf '{\n  "nation": "se"\n}')"
-check glob-nomatch   "$G" 'deep.zzz+'    0 '{}'
 
 # globbing is only defined on objects
-check glob-on-array  "$G" 'array.n+'     1 ''
-check glob-on-scalar "$G" 'num.+'        1 ''
+t glob-on-array "$G" 1 '' 'array.n+'
+
+# a prefix pattern keeps every matching key, so the matcher must backtrack
+t glob-prefix-multi "$G" 0 "$(printf '{\n  "a": {\n    "x": 1\n  },\n  "ab": {\n    "x": 2\n  }\n}')" 'deep.a+'
 
 # --- [@] : array to stream of elements ---
 S='{"a":[{"name":"ada","nationalitie":"se","movie":1},{"name":"bob","nationalitie":"no","movie":2}],"n":[[1,2],[3,4]],"num":5,"o":{"k":1}}'
-check st-plain     "$S" 'a[@].name'   0 "$(printf '"ada"\n"bob"')"
-check st-inner     "$S" 'a[@.name]'   0 "$(printf '"ada"\n"bob"')"
-check st-glob      "$S" 'a[@.+ie]'    0 "$(printf '{\n  "nationalitie": "se",\n  "movie": 1\n}\n{\n  "nationalitie": "no",\n  "movie": 2\n}')"
-check st-slice     "$S" 'a[-1:][@.name]' 0 '"bob"'
-check st-whole     "$S" 'a[@]'        0 "$(printf '{\n  "name": "ada",\n  "nationalitie": "se",\n  "movie": 1\n}\n{\n  "name": "bob",\n  "nationalitie": "no",\n  "movie": 2\n}')"
-check st-nested    "$S" 'n[@][@]'     0 "$(printf '1\n2\n3\n4')"
-check st-index     "$S" 'n[@][0]'     0 "$(printf '1\n3')"
-check st-empty     "$S" 'a[0:0][@]'   0 ''
-checkf st-raw      "$S" 0 "$(printf 'ada\nbob')" -r 'a[@.name]'
+t st-glob "$S" 0 "$(printf '{\n  "nationalitie": "se",\n  "movie": 1\n}\n{\n  "nationalitie": "no",\n  "movie": 2\n}')" 'a[@.+ie]'
+t st-nested "$S" 0 "$(printf '1\n2\n3\n4')" 'n[@][@]'
+t st-empty "$S" 0 '' 'a[0:0][@]'
 
 # [@] is defined on arrays only
-check st-on-scalar "$S" 'num[@]'      1 ''
-check st-unclosed  "$S" 'a[@'         1 ''
-check st-traildot  "$S" 'a[@.]'       1 ''
-
-# a named key absent from any element still fails the whole query
-check st-missing   "$S" 'n[@].name'   1 ''
+t st-on-scalar "$S" 1 '' 'num[@]'
+t st-unclosed "$S" 1 '' 'a[@'
+t st-traildot "$S" 1 '' 'a[@].'
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
