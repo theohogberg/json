@@ -1,8 +1,11 @@
 # json
 
-A zero-dependency JSON formatter and query tool for the shell. C99, libc only
-(POSIX `read`/`fstat`, or Win32 `ReadFile`/`GetFileType` under `_WIN32`), one
-translation unit: `src/json.c` (which includes the generated `src/unicat.h`).
+`json` is a fast replacement for jq's common uses: reformat JSON, select from
+it, and query it with JSONPath (RFC 9535). It is written in C99 against libc
+only and accelerates its hot loop with SIMD. Everything is one translation
+unit, `src/json.c`, which includes the generated `src/unicat.h`. The only OS
+calls are POSIX `read`/`fstat`, or Win32 `ReadFile`/`GetFileType` under
+`_WIN32`.
 
 ```
 curl -s URL | json                      # reformat
@@ -10,6 +13,20 @@ curl -s URL | json users.0.name         # select
 curl -s URL | json -r users[@.name]     # stream, unquoted
 curl -s URL | json --rfc9535 '$.users[?@.age > 30].name'
 ```
+
+The goals, in priority order:
+
+1. **Correct.** Reformatted output is byte-identical to `jq .`, `--rfc9535`
+   passes the JSONPath Compliance Test Suite, and the parser passes
+   JSONTestSuite.
+2. **Fast.** Reformatting is ~18x faster than jq. Every change to a hot path
+   is measured (see Benchmarks).
+3. **Bounded memory.** Piped input is processed in a sliding window, so
+   reformatting and per-element queries run in ~1.3 MB for any input
+   size.
+4. **Shell-friendly.** The default query dialect avoids `$` and `*`, so
+   dotted paths and `+` globs work unquoted in sh, bash and zsh. Brackets
+   still need quotes in zsh (see design.md, section 1).
 
 ## Build and test
 
@@ -22,287 +39,391 @@ make conformance          # JSONTestSuite (cloned on first run)
 make jsonpath             # JSONPath Compliance Test Suite (cloned on first run)
 make fuzz [SEED=N]        # differential vs Python's json; prints its seed
 make diff                 # SIMD and scalar builds must emit identical output
-make ci                   # all of the above, ~2 min — run before committing
-make DEPTH=256 test       # flag changes rebuild; checked when make starts
+make ci                   # all of the above, ~2 min; run before committing
+make DEPTH=256 test       # changed flags trigger a rebuild, checked at startup
 ```
 
-On Windows the same targets work from MSYS2, MinGW or Git Bash (`OS=Windows_NT`
-adds `.exe`, exports `PYTHONUTF8=1`, and defaults `CC` to the first of gcc,
-clang, cl on PATH). Recipes need a POSIX `sh`: from `cmd.exe`, where make
-would fall back to cmd, the makefile finds Git for Windows' `usr\bin\sh.exe`
-via `git.exe` and puts that directory on PATH. With `cl` or `clang-cl` the
-makefile switches to MSVC flags (`-std:c11 -O2 -W4`), and `check`/`fuzz` use
-MSVC's ASan, without UBSan; MinGW has no ASan. Without make:
-`cl /O2 /std:c11 src\json.c /Fe:json.exe`. `make ci` is verified green with
-MSVC 19.44 (x86) from Git Bash and GnuWin32 make 3.81; MinGW gcc is untested.
-A Developer Command Prompt's `cl` targets 32-bit x86 by default; build from an
-x64 prompt (`vcvars64.bat`), which is ~15% faster (see Benchmarks).
-`os_init` rebuilds `argv` as UTF-8 from `GetCommandLineW`, since the CRT's
-ANSI `argv` turns a query like `$.☺` into `$.?`.
+Run `make ci` before every commit; it must pass. The current baseline is
+**108/108 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
+because their selector contains NUL), fuzz clean**.
 
-`make ci` must be green before any commit. Baseline: **108/108 tests, 283/283
-conformance, 713/713 JSONPath compliance (2 skipped: NUL in the selector),
-fuzz clean**.
+### Windows
 
-## Non-negotiables
+The same targets work from MSYS2, MinGW or Git Bash. When `OS=Windows_NT`,
+the makefile:
 
-Settled decisions, not preferences. Changing one needs a reason.
+- adds `.exe` to every output;
+- exports `PYTHONUTF8=1` so the test scripts write UTF-8;
+- sets `CC` to the first of gcc, clang and cl found on PATH;
+- switches to MSVC flags (`-std:c11 -O2 -W4`) when `CC` is `cl` or
+  `clang-cl`. `check` and `fuzz` then use MSVC's ASan, which has no UBSan.
+  MinGW has no ASan at all.
 
-- **No dependencies beyond libc.** No getopt_long (GNU-only), nothing
-  third-party. Option parsing is hand-rolled on purpose. The only OS calls are
-  `os_read`, `os_file_size`, `os_init` and `os_out_closed`, one `#ifdef _WIN32`
-  block: POSIX `read`/`fstat` (`_POSIX_C_SOURCE` at the top) or Win32
-  `ReadFile`, with a pipe's `ERROR_BROKEN_PIPE` as EOF and stdout set binary,
-  since a `\r\n` would break byte-identity with `jq .`. A reader closing the
-  pipe early (`json ... | head`) exits 1 without a message: SIGPIPE on POSIX,
-  `ERROR_NO_DATA` on Windows, where the CRT reports it as `EINVAL`.
-- **Builds clean** under `-std=c99 -O3 -Wall -Wextra -pedantic`. Fix a
-  warning, don't silence it.
-- **Output is byte-identical to `jq .`** for reformatting (verified on 4.6 MB
-  against jq 1.7.1). A change that alters output is a bug unless it's the point.
-- **Never free.** Exit reclaims. LeakSanitizer is therefore useless, and
-  `ASAN_OPTIONS=detect_leaks=0` in `SANENV` must stay.
-- **Numbers keep their raw lexeme**, so `1.50` and `1e309` round-trip. Never
-  convert to double, not even to compare: RFC filters compare lexemes as exact
-  decimals (`numcmp`). A slurped buffer never moves, so the tree points into
-  it; a streamed window does, so `parse_value` copies lexemes to the arena.
+Recipes need a POSIX `sh`. When make runs from `cmd.exe`, it would use cmd
+as its shell; to prevent that, the makefile locates `git.exe`, takes Git for
+Windows' `usr\bin\sh.exe` beside it, and adds that directory to PATH.
+
+Without make: `cl /O2 /std:c11 src\json.c /Fe:json.exe`.
+
+Use an x64 prompt (`vcvars64.bat`). A Developer Command Prompt's `cl`
+targets 32-bit x86 by default, and that build is ~15% slower (see
+Benchmarks).
+
+`os_init` rebuilds `argv` as UTF-8 from `GetCommandLineW`. The CRT's own
+`argv` uses the ANSI code page, which turns a query like `$.☺` into `$.?`.
+
+Verified: `make ci` passes with MSVC 19.44 (x86) under Git Bash and GnuWin32
+make 3.81. MinGW gcc is untested.
+
+## Rules
+
+Each rule records a decision already made. To change one, give a reason.
+
+- **Depend on libc only.** Nothing third-party, and no GNU-only functions
+  such as `getopt_long`; option parsing is hand-rolled for this reason. All
+  OS-specific code is four functions in one `#ifdef _WIN32` block:
+  `os_read`, `os_file_size`, `os_init` and `os_out_closed`.
+  - POSIX uses `read`/`fstat`, enabled by `_POSIX_C_SOURCE` at the top of
+    the file.
+  - Windows uses `ReadFile` and treats a pipe's `ERROR_BROKEN_PIPE` as EOF.
+    It sets stdout to binary mode, because a `\r\n` would break
+    byte-identity with `jq .`.
+  - When the reader closes the pipe early (`json ... | head`), exit 1
+    without a message. On POSIX, SIGPIPE does this. On Windows the write
+    fails with `ERROR_NO_DATA`, which the CRT reports as `EINVAL`.
+- **Build without warnings** under `-std=c99 -O3 -Wall -Wextra -pedantic`.
+  Fix the code that causes a warning; do not suppress the warning.
+- **Keep reformatted output byte-identical to `jq .`** (verified on 4.6 MB
+  against jq 1.7.1). Treat any change in output as a bug unless the change
+  is the purpose of the commit.
+- **Never free memory.** The process exit reclaims it. For this reason
+  LeakSanitizer is useless here, and `ASAN_OPTIONS=detect_leaks=0` in
+  `SANENV` must stay.
+- **Keep every number's raw lexeme**, so `1.50` and `1e309` round-trip.
+  Never convert a number to double, even to compare it: RFC filters compare
+  lexemes as exact decimals (`numcmp`). A slurped buffer never moves, so the
+  tree points into it. A streamed window does move, so `parse_value` copies
+  lexemes into the arena.
 
 ## Architecture
 
-**Input: slurp or stream, by `fstat`.** `input()` reads a regular file under
-`SLURP_MAX` (256 MiB) whole, in one `read`. Anything else (pipe, socket,
-terminal, huge file) streams through a `WINDOW` (64 KiB) that `more()` slides,
-keeping the unread `s[i..n)`. So **scanners never advance `i` mid-token**:
-`str_end` re-bases in `str_slow`, `scan_number` rescans a number that runs
-into the window's end, `lit` asks `avail()`. `skipws()` leaves a byte in the
-window unless input is over, which is why `peek()` never refills. `more()`
-flushes output before it blocks, so results appear before EOF. Piped, any
-input reformats or answers `[@.name]` in ~1.3 MB.
+### Input: slurp or stream, chosen by `fstat`
 
-1. **No filter → streaming.** `emit_value()` validates and reformats in one
-   pass, no allocation, no tree. ~18x faster than jq; never route it through
-   the tree.
-2. **Path → `swalk()` over the parse.** A key or a non-negative index steps
-   into one member and `skip_value()`s the rest unbuilt; `[@]` handles one
-   element at a time. Whatever needs a value whole (globs, slices, negative
-   indexes, `-r` strings) and every error goes to `walk()` on a tree of just
-   that value, so the two share one set of semantics. Output can precede a
-   parse error later in the input; the exit code is still 1.
-3. **`--rfc9535` → tree.** The query compiles first (`rfc_parse`), so a bad
-   one fails before input is read. `$` in a filter can reach anything, so the
-   whole document is parsed; `r_apply()` sends nodes to the sink depth first,
-   which is RFC order.
+`input()` reads a regular file smaller than `SLURP_MAX` (256 MiB) whole, in
+one `read`. Any other input (pipe, socket, terminal, larger file) streams
+through a `WINDOW` (64 KiB) that `more()` slides forward, keeping the unread
+bytes `s[i..n)`.
 
-**Results go through a sink** because `[@]` makes the result count a runtime
-property; anything returning one value had to be rewritten once already. A
-stream is a stream whatever its cardinality: a future collect flag must give
-`["ada"]`, not `"ada"`, for a one-element array.
+Because the window can move, **a scanner must never advance `i` in the
+middle of a token**:
 
-**Per-element memory is bounded.** `sstream()` and `stream_array()` restore an
-arena mark after each element, so everything built while answering a query
-must come from the arena (`push` uses `arena_grow`, never `xrealloc`). On a
-15 MB file piped, `[@]`, `[@.name]` and `[@.+ie]` all peak at ~1.3 MB; `[-1]`
-still trees the whole array.
+- `str_end` re-bases its position in `str_slow`.
+- `scan_number` rescans a number that runs into the end of the window.
+- `lit` asks `avail()` for enough bytes before matching a literal.
+- `skipws()` leaves at least one byte in the window unless input has ended,
+  so `peek()` never needs to refill.
 
-**The tree is exact-size.** The parser does not use `push`: doubling in the
-arena abandons every outgrown block (+14% RSS). Children collect on a reusable
-scratch stack and each container is copied into the arena once when it closes:
-84 MB on a 12 MB file, against 141 MB for the old realloc tree. Arena alignment
-is 8; 16 padded every 40-byte `jval` to 48.
+`more()` flushes pending output before it blocks on a read, so results
+appear before EOF. Piped, any input reformats or answers `[@.name]` in
+~1.3 MB.
 
-**Hot-path inlining is load-bearing.** `om`, `os_`, `str_end`, `num_len` and
-`scan_number` are `always_inline`, with rare branches split into
-`om_slow`/`str_slow`, which are `COLD` (noinline): left to itself clang inlined
-`om_slow` back into every `om` once the file grew. Without it short strings run
-15–25% slower. Literals are emitted with constant-length `os_`; the
-variable-length copy cost 8%, and `os_` stopped inlining when the RFC code was
-added.
+### Three evaluation paths
 
-**SIMD lives in `scan_str` only.** It must read only `s[0..n)`, return what
-the scalar loop would, fall through to it for the tail, and sit under
-`!defined(NOSIMD)`. Per target:
-- x86: SSE2, which every x86-64 has; SSE4.2's string instructions are slower
-  for this. AVX2 takes strings past 24 bytes when the build targets it
-  (`-mavx2`) or when the CPU reports it at run time (`simd_init()`:
-  `__builtin_cpu_supports` with GCC/clang, `__cpuid` with MSVC), so one binary
-  fits every x86-64. `-DNOAVX2` stops at SSE2 (`out/json.sse2`).
-- 32-bit x86 with MSVC: no `_BitScanForward64`, so `ctz64` takes two 32-bit
-  scans. The bit-by-bit fallback it used to hit ran on nearly every string
-  (the SWAR test below finds most closing quotes) and made the SIMD build 50%
-  slower than scalar.
-- ARM: NEON, with `vshrn` standing in for `movemask`.
+1. **No query: stream.** `emit_value()` validates and reformats in a single
+   pass, with no allocation and no tree. This path is ~18x faster than jq;
+   never route it through the tree.
+2. **Default-dialect path: `swalk()` over the parse.** A key or a
+   non-negative index steps into one member and passes over the rest with
+   `skip_value()`, which builds nothing. `[@]` handles one element at a
+   time. Anything that needs a whole value (globs, slices, negative indexes,
+   `-r` strings), and every error, goes to `walk()` on a tree of just that
+   value, so both functions share one set of semantics. Output can precede a
+   parse error later in the input; the exit code is then still 1.
+3. **`--rfc9535`: whole tree.** The query compiles first (`rfc_parse`), so a
+   bad query fails before any input is read. A `$` inside a filter can reach
+   any part of the document, so the whole document is parsed. `r_apply()`
+   sends nodes to the sink depth first, which is RFC order.
 
-The first 8 bytes are a 64-bit SWAR test, not a vector: most strings are
-short keys, and NEON without it made `[@.name]` 8% *slower* than scalar.
-`scan_ws` stays scalar because a vector loop lost on both compact (1-byte
-runs) and indented input. NEON, measured: reformat −10%, long strings 2.1x,
-queries even. x86-64, measured with MSVC on Zen 5 (see Benchmarks): SIMD over
-scalar is −7% on reformat and filters, even on queries; AVX2 is level with
-SSE2, and run-time dispatch with `/arch:AVX2`. On 32-bit x86 SIMD gains
-nothing.
+### Results go through a sink
 
-## Query syntax
+`[@]` makes the number of results a runtime property, and code that returned
+a single value had to be rewritten once already for this reason. Treat every
+result as a stream, of any length. A future collect flag must
+therefore print `["ada"]` for a one-element array, and never a bare `"ada"`.
 
-Not JSONPath, though it borrows from it. RFC 9535's `[*]`, and `@` only inside
-filters, are deliberate deviations.
+### Per-element memory is bounded
+
+`sstream()` and `stream_array()` restore an arena mark after each element.
+Everything built while answering a query must therefore come from the arena:
+`push` uses `arena_grow` and never `xrealloc`. On a 15 MB file piped,
+`[@]`, `[@.name]` and `[@.+ie]` all peak at ~1.3 MB. `[-1]` still builds a
+tree of the whole array.
+
+### The tree is allocated at its exact size
+
+The parser does not use `push`, because doubling inside the arena abandons
+every outgrown block (+14% RSS). Children collect on a reusable scratch
+stack, and each container is copied into the arena once, when it closes.
+Result: 84 MB on a 12 MB file, against 141 MB for the old realloc-based
+tree. Arena alignment is 8; an alignment of 16 padded every 40-byte `jval`
+to 48 bytes.
+
+### Hot-path inlining
+
+`om`, `os_`, `str_end`, `num_len` and `scan_number` are `always_inline`.
+Their rare branches are split out into `om_slow` and `str_slow`, which are
+marked `COLD` (noinline). Keep both markings: without `COLD`, clang inlined
+`om_slow` back into every `om` once the file grew, and without inlining,
+short strings run 15–25% slower.
+
+Emit literals with constant-length `os_`. A variable-length copy cost 8%, and
+`os_` stopped being inlined when the RFC code was added.
+
+### SIMD
+
+All SIMD code lives in `scan_str`. It must:
+
+- read only `s[0..n)`;
+- return exactly what the scalar loop would;
+- fall through to the scalar loop for the tail;
+- sit under `!defined(NOSIMD)`.
+
+Per target:
+
+- **x86-64:** SSE2, which every x86-64 CPU has. SSE4.2's string
+  instructions are slower for this job. Strings longer than 24 bytes go to
+  AVX2 when the build targets it (`-mavx2`) or when the CPU reports it at
+  run time. `simd_init()` checks with `__builtin_cpu_supports` under
+  GCC/clang and `__cpuid` under MSVC, so one binary fits every x86-64 CPU.
+  `-DNOAVX2` stops at SSE2 (`out/json.sse2`).
+- **32-bit x86 with MSVC:** there is no `_BitScanForward64`, so `ctz64` uses
+  two 32-bit scans. It previously fell back to a bit-by-bit loop, which ran
+  on nearly every string (the SWAR test below finds most closing quotes)
+  and made the SIMD build 50% slower than scalar.
+- **ARM:** NEON, with `vshrn` in place of x86's `movemask`.
+
+The first 8 bytes of every string are tested as one 64-bit word (SWAR)
+before any vector code runs. Most strings are short keys; without this test,
+NEON made `[@.name]` 8% slower than scalar.
+
+`scan_ws` stays scalar. A vector loop was slower on both compact input
+(whitespace runs of 1 byte) and indented input.
+
+Measured gains over scalar:
+
+- NEON: reformat −10%, long strings 2.1x faster, queries unchanged.
+- x86-64, MSVC on Zen 5 (see Benchmarks): reformat and filters −7%, queries
+  unchanged. AVX2 performs the same as SSE2, and run-time dispatch performs
+  the same as `/arch:AVX2`.
+- 32-bit x86: no gain.
+
+## Query language
+
+### Default dialect
+
+The default dialect is based on JSONPath, with two deliberate differences
+from RFC 9535: iteration is written `[@]` where RFC writes `[*]`, and `@`
+also appears outside filters.
 
 ```
 users.0.name        dotted path; works on objects and arrays
 users[0]            bracket index, negative allowed: users[-1]
-users[1:3]          slice — Python semantics exactly
-users.na+           glob object keys; '+' not '*'
+users[1:3]          slice, with Python semantics
+users.na+           glob object keys; '+' instead of '*'
 users[@.name]       stream: one result per element, or per object value
 users[?@.age > 30]  filter: stream the elements (or values) that match
 ..id  a..name       search every depth: ..key, ..['k'], ..[n], ..[@], ..[?]
-['a.b']  ["x y"]    quoted name: any key, '.', '[', '+' and all
+['a.b']  ["x y"]    quoted name: any key, including '.', '[' and '+'
 a[0:3,1]  o['x','y']  union: one sub-array or sub-object, each member once
 ```
 
-**Slices are Python's**, verified case by case: negative indices, clamped
-bounds, negative steps, `[3:1]` is `[]`, a zero step is an error (not RFC's
-"selects nothing"). A slice is one sub-array, not a stream.
+**Slices follow Python exactly**, verified case by case: negative indices,
+clamped bounds, negative steps, and `[3:1]` gives `[]`. A zero step is an
+error (RFC 9535 selects nothing instead). A slice yields one sub-array.
 
-**`+` globs, not `*`**: the shell expands `*` against the working directory
-(`json pre*.hello` with a file `pre1.hello` present silently becomes another
-valid query). `+` survives sh, bash and zsh unquoted. Otherwise exactly
-`fnmatch(3)` (2908 patterns, zero mismatches); no character classes, since `[`
-means index-or-slice. Globbing an object returns an object; globbing anything
-else is an error.
+**Globs use `+` because the shell expands `*`** against the working
+directory: with a file `pre1.hello` present, `json pre*.hello` would run the
+query `pre1.hello`. `+` passes through sh, bash and zsh unquoted. Apart from
+that, globs behave exactly like `fnmatch(3)` (2908 patterns compared, zero
+mismatches). There are no character classes, because `[` starts an index or
+slice. Globbing an object returns an object; globbing any other type is an
+error.
 
-**`--rfc9535`** switches to RFC 9535 JSONPath: `$` required, `[*]`, `..`,
-`['name']`, unions, filters `[?...]` with `== != < <= > >=`, `&& || !`, and
-`length count value match search`. Results are a nodelist, one node per line,
-nothing (and rc 0) for none; a slice yields its elements, step 0 selects
-nothing, a missing key selects nothing. `match`/`search` take I-Regexp
-(RFC 9485) on a Pike VM over code points, so no pattern backtracks; `\p{..}`
-uses `src/unicat.h`, generated by `src/unicat.py` from Python's Unicode
-tables. `^` and `$` anchor, although RFC 9485's grammar makes them plain
-characters, because the compliance suite expects it. Duplicate keys select
-the first, as in the default dialect.
+**Filters `[?...]` use RFC 9535's grammar and semantics.** The RFC code
+parses and evaluates them (`path_filter`, `x_true`). Inside a filter, paths
+from `@` or `$` are JSONPath (`@.tags[0]`; the default form `@.tags.0` does
+not work there), and a missing member makes the test false instead of
+raising an error. `match()` and `search()` are refused in this dialect; the
+default dialect will get its own regex behaviour later. A filter streams
+each matching element or object value through the rest of the path, as
+`[@]` does. `bracket_end` skips a filter as a whole, so a `"]"` inside one
+is safe. All filters compile before input is read. If a filter uses `$`,
+`main` builds a tree of the whole document; otherwise `sfilter()` builds a
+tree of one element at a time (1.4 MB piped on a 15 MB file).
 
-**`[?...]` filters are RFC 9535's**, parsed and evaluated by the RFC code
-(`path_filter`, `x_true`), so inside one `@`/`$` paths are JSONPath
-(`@.tags[0]`, not `@.tags.0`) and a missing member is false, not an error.
-`match()`/`search()` are refused: regex in the standard dialect will get its
-own behaviour later. A filter streams each matching element or object value
-through the rest of the path, as `[@]` does. `bracket_end`
-skips a filter whole, so `"]"` inside one is safe. All filters compile before
-input is read; one using `$` makes `main` tree the whole document, otherwise
-`sfilter()` trees one element at a time (1.4 MB piped on 15 MB).
+**`[@]` and `[?]` accept arrays and objects.** On an object they see the
+values and drop the keys, so `users[@.name]` works whether `users` is a list
+or a map such as `{"u1": {...}}`. This is RFC 9535's `*` in a shell-safe
+spelling.
 
-**`[@]` and `[?]` take arrays and objects**; on an object they see the
-values and drop the keys, so `users[@.name]` works whether users is a list or
-a map like `{"u1": {...}}`. That is RFC's `*`, spelled the shell-safe way.
+**`..` is a search, so it never fails on a missing match.** `..id` means
+`$..id`: the selector applies to the node and then to every descendant,
+depth first, with a node's own matches before its children's (the order RFC
+9535 and jq use). Whatever follows the selector applies to each match with
+the usual strictness, so `..[@.name]` fails on the first element that lacks
+`name`; write `..name` instead. `..` builds a tree of the value it searches.
 
-**`..` is a search**, so it never errors on what it doesn't find: `..id` is
-`$..id`, the selector applied to the node and then to every descendant, depth
-first, a node's own matches before its children's (RFC and jq order). What
-follows the selector applies to each match with the usual strictness, so
-`..[@.name]` fails on the first element without `name`; write `..name`.
-`..` trees the value it searches.
+**Quoted names** (`['a.b']`, `["x y"]`) use RFC string syntax and escapes and
+select exactly that key: no globbing, and a missing key is an error.
+`bracket_end` and the root prescan skip quoted names as a whole, so `['k]']`
+is safe. A quote starts a name only directly after `[` or `,`.
 
-**Quoted names** (`['a.b']`, `["x y"]`) take RFC string syntax and escapes and
-select exactly that key: no globbing, missing is an error. `bracket_end` and
-the root prescan skip them whole, so `['k]']` is safe; a quote starts a name
-only right after `[` or `,`.
-
-**Unions keep the shape, unlike RFC's.** `a[0:3,1]` is one array `[a0, a1, a2]`
-and `o['y','x']` one object, as a slice or a glob is one value: each member
-once, in the order first asked, never a stream. A missing name or index
-errors; a slice in a union clamps. Names need an object and indexes an array.
+**Unions keep their shape**, unlike RFC 9535's. `a[0:3,1]` gives one array
+`[a0, a1, a2]` and `o['y','x']` one object, in the same way a slice or a
+glob gives one value. Each member appears once, in the order first asked
+for; a union never streams. A missing name or index is an error; a slice
+inside a union clamps. Names require an object and indexes an array.
 Whitespace is allowed inside brackets.
 
-**`[@...]` is meant to be terminal**: `users[@.name]`, with nesting as
-`n[@[@]]`, because a stream is not an object for a `.` suffix to select from.
-Not enforced yet: `users[@].name` still succeeds.
+**`[@...]` is meant to end a path**: `users[@.name]`, nested as `n[@[@]]`. A
+stream is not an object, so a `.` suffix has nothing to select from. This is
+not enforced yet: `users[@].name` still succeeds.
 
-**Errors vs empty.** An absent named key is an error (exit 1); a pattern
-matching nothing is empty — Python's `d['x']` vs a comprehension. Out-of-range
-index errors; out-of-range slice clamps. A filter or a `..` search that finds
-nothing is empty.
+**Errors versus empty results.** A missing named key is an error (exit 1). A
+pattern that matches nothing gives an empty result. This mirrors Python's
+`d['x']` versus a comprehension. An out-of-range index is an error; an
+out-of-range slice clamps. A filter or a `..` search that finds nothing
+gives an empty result.
+
+### `--rfc9535`
+
+With `--rfc9535` the query is RFC 9535 JSONPath: `$` is required, and it
+supports `[*]`, `..`, `['name']`, unions, and filters `[?...]` with
+`== != < <= > >=`, `&& || !` and the functions `length`, `count`, `value`,
+`match` and `search`.
+
+- The result is a nodelist, printed one node per line. No match prints
+  nothing and exits 0.
+- A slice yields its elements one by one; step 0 selects nothing; a missing
+  key selects nothing.
+- `match` and `search` take I-Regexp (RFC 9485) and run on a Pike VM over
+  code points, so no pattern can backtrack. `\p{..}` uses `src/unicat.h`,
+  generated by `src/unicat.py` from Python's Unicode tables.
+- `^` and `$` act as anchors, because the compliance suite expects it, even
+  though RFC 9485's grammar treats them as plain characters.
+- With duplicate keys, the first one is selected, as in the default dialect.
 
 ## Flags
 
 ```
 -r, --raw-output    string result without quotes or escapes
     --raw           alias
-    --rfc9535       the path is RFC 9535 JSONPath (see Query syntax)
+    --rfc9535       the path is RFC 9535 JSONPath (see Query language)
 -h, --help
 --                  end of options
 ```
 
-Short options cluster (`-rh`); long options take no abbreviations. `-r` applies
-only when the result itself is a string; nested strings stay quoted so the
-output is still JSON. `--raw-output` is primary because jq also has
-`--raw-input`, which makes a bare `--raw` ambiguous.
+Short options cluster (`-rh`). Long options cannot be abbreviated. `-r`
+applies only when the result itself is a string; strings nested inside the
+result stay quoted, so the output remains valid JSON. `--raw-output` is the
+primary name because jq also has `--raw-input`, which makes a bare `--raw`
+ambiguous.
 
 ## Not implemented
 
-- **Regex in standard filters.** `match`/`search` exist only under
-  `--rfc9535`; the standard dialect will get its own regex behaviour.
-- **Streaming `--rfc9535`.** It always builds the whole tree; `$.a[*].b` with
-  no `$` in a filter could stream like `[@]`.
-- **Multiple JSON values on stdin.** A second value is "trailing data" today,
-  so `json a[@.x] | json y` cannot compose. The window makes this a matter of
-  looping in `main`.
-- **Error tolerance.** `n[@.name]` fails if any element lacks `name`. jq's `?`
-  is the precedent; it is unrelated to RFC 9535's `[?...]`, so decide the
-  spelling before implementing either.
+- **Regex in default-dialect filters.** `match` and `search` exist only
+  under `--rfc9535`; the default dialect will get its own regex behaviour.
+- **Streaming `--rfc9535`.** It always builds the whole tree. A query such
+  as `$.a[*].b`, with no `$` inside a filter, could stream the way `[@]`
+  does.
+- **Multiple JSON values on stdin.** A second value is rejected as
+  "trailing data", so `json a[@.x] | json y` cannot compose. The window
+  reduces this to a loop in `main`.
+- **Error tolerance.** `n[@.name]` fails if any element lacks `name`. jq's
+  `?` operator is the precedent. It is unrelated to RFC 9535's `[?...]`, so
+  choose a spelling before implementing either.
 
 ## Testing
 
-`test/test.sh` (`t NAME INPUT RC OUT [ARGS...]`; stdout checked only on rc 0),
-`test/conformance.sh` (JSONTestSuite), `test/jsonpath.py` (the JSONPath
-Compliance Test Suite), `test/fuzz.py` (vs Python), and `test/corpus.py`
-(input for `make diff`), and `test/edges.py` (`make check`: strings and
-whitespace of every length 0-199 ending at the file's last byte). The first
-three run every case twice, piped
-(streamed) and redirected (slurped), and the ASan build uses `-DWINDOW=7` so
-`make check` puts every token across a refill. Everything runs one process per core
-(`JOBS=N` for the shell scripts): a sanitizer build spends ~45 ms starting and
-<1 ms working, and no `ASAN_OPTIONS` setting changes that.
+| file | what it runs |
+|---|---|
+| `test/test.sh` | regression cases: `t NAME INPUT RC OUT [ARGS...]`; stdout is checked only when rc is 0 |
+| `test/conformance.sh` | JSONTestSuite |
+| `test/jsonpath.py` | JSONPath Compliance Test Suite |
+| `test/fuzz.py` | differential test against Python's `json` |
+| `test/corpus.py` | generates the input for `make diff` |
+| `test/edges.py` | `make check`: strings and whitespace of every length 0–199, ending at the file's last byte |
 
-**The suite is minimal by measurement; don't prune or pad it by eye.** The 76
-default-dialect cases were cut from 140 with 1291 mutants of `json.c` (operator, literal and ±1
-swaps including hex, statement deletion, and each `die`/`perr` turned into a
-silent `exit(0)`). Each of the 76 cases is the only one catching some mutant.
-A by-judgement pass had kept 111 yet dropped six cases that were the only ones
-catching something. Error cases check only the exit code, so only the `exit(0)`
-operator tells error sites apart. The `flt-`, `desc-`, `qname-`, `union-`, `obj-` and `rfc-` cases (the `rfc-` ones cover what the compliance
-suite cannot: output format, `-r`, exact numbers) and `pipe-closed` (no stderr
-when the reader quits early; only Windows can fail it) have not been through a
-mutation run yet.
+The first three run every case twice: piped (streamed) and redirected
+(slurped). The ASan build uses `-DWINDOW=7`, so under `make check` every
+token straddles a window refill. All scripts run one process per core (set
+`JOBS=N` for the shell scripts): a sanitizer build spends ~45 ms starting
+and under 1 ms working, and no `ASAN_OPTIONS` setting reduces the startup.
 
-Add a case for every behaviour change. Known gaps: no case reaches the tree
-parser's syntax errors (malformed input is only tested without a filter, and
-`json a` parses differently from `json`), `path nesting too deep`, `number too
-large in path`, or `index ... is too large`.
+**The suite is minimal by measurement. Do not prune or pad it by
+judgement.** The 76 default-dialect cases were cut from 140 using 1291
+mutants of `json.c`: operator, literal and ±1 swaps (hex included),
+statement deletion, and each `die`/`perr` replaced by an `exit(0)` without a message.
+Each of the 76 cases is the only one that catches some mutant. An earlier
+pass by judgement kept 111 cases, yet dropped six that were the only ones
+catching something. Error cases check only the exit code, so only the
+`exit(0)` mutant tells error sites apart.
 
-**Conformance alone is not enough.** An injected off-by-one in a vector loop
-passed every test, all conformance and byte-identical output on 4.6 MB while
-reading out of bounds; ASan caught it only with an input sized to the
-allocation edge. Hence `test/edges.py`, and a slurped file's buffer is exactly
-its size (`more()` probes one byte before growing a full buffer): with one
-byte of slack, a planted `i + 15 <= n` in every SIMD loop went unreported. The arena blunts ASan further: overflowing one sub-allocation
-into the next is a legal write inside a live chunk.
+Not yet through a mutation run: the `flt-`, `desc-`, `qname-`, `union-`,
+`obj-` and `rfc-` cases, and `pipe-closed`. The `rfc-` cases cover what the
+compliance suite cannot: output format, `-r` and exact numbers.
+`pipe-closed` checks that nothing reaches stderr when the reader quits
+early; only a Windows build can fail it.
+
+Add a case for every behaviour change. Known gaps, with no case reaching
+them:
+
+- the tree parser's syntax errors (malformed input is tested only without a
+  query, and `json a` parses differently from `json`);
+- `path nesting too deep`;
+- `number too large in path`;
+- `index ... is too large`.
+
+**Run the sanitizers; conformance is not enough.** An off-by-one injected
+into a vector loop passed every test, all of conformance and a byte-identical
+4.6 MB output comparison, while reading out of bounds. ASan caught it only
+with an input sized to end exactly at the allocation edge. Two measures
+follow from this:
+
+- `test/edges.py` generates inputs that end at every length.
+- A slurped file's buffer is exactly the file's size: `more()` probes for
+  one more byte before it grows the buffer. With one byte of slack, a
+  planted `i + 15 <= n` in every SIMD loop went unreported.
+
+The arena weakens ASan further: an overflow from one sub-allocation into the
+next is a legal write inside a live chunk.
 
 ## Benchmarks
 
-Against jq 1.7.1 on a 4.6 MB array of 15,840 objects, output byte-identical:
+Against jq 1.7.1 on a 4.6 MB array of 15,840 objects, output byte-identical
+(measured before streaming input existed):
 
 | | jq | json |
 |---|---|---|
 | reformat whole doc | 154.8 ms | 8.5 ms (18x) |
 | select one deep value | 54.0 ms | 12.5 ms (4.3x) |
 
-Those predate streaming. Against the previous commit, on a 15 MB array of
-60,000 objects (best of 20; arm64): reformatting a file 32.5 → 34.1 ms (the
-refill checks; piped 36.4 → 34.2), `5000.nested.a.b` 32 → 24 ms and
-`[@.name]` 38 → 27 ms, at 15.7 MB instead of 80 MB from a file and 1.3 MB
-piped. `jq --stream` is flat at 6.2 MB.
+Effect of adding streaming input, on a 15 MB array of 60,000 objects (best
+of 20; arm64):
+
+| | before | after |
+|---|---|---|
+| reformat, from a file | 32.5 ms | 34.1 ms (cost of the refill checks) |
+| reformat, piped | 36.4 ms | 34.2 ms |
+| `5000.nested.a.b` | 32 ms | 24 ms |
+| `[@.name]` | 38 ms | 27 ms |
+| peak memory | 80 MB | 15.7 MB from a file, 1.3 MB piped |
+
+For comparison, `jq --stream` stays flat at 6.2 MB.
 
 Windows, MSVC 19.44 `-O2`, Ryzen 9 9900X, on a synthetic 23.9 MB array of
-60,000 objects (best of 15, input from a file, ms; piped is 3–4 ms faster):
+60,000 objects (best of 15, input from a file, in ms; piped input is 3–4 ms
+faster):
 
 | | x86 | x86 scalar | x64 | x64 SSE2 | x64 scalar |
 |---|---|---|---|---|---|
@@ -312,14 +433,22 @@ Windows, MSVC 19.44 `-O2`, Ryzen 9 9900X, on a synthetic 23.9 MB array of
 | `[?@.age > 80].id` | 39.5 | 39.8 | 34.2 | 34.4 | 37.2 |
 | `--rfc9535 '$[?@.age > 80].id'` | 57.1 | 57.1 | 57.8 | 58.4 | 61.3 |
 
-x86 and x64 are the default builds (AVX2 chosen at run time); x86 is after
-the `ctz64` fix, before which it took 48–75 ms. Process spawn is 3.5–4.5 ms of
-each run. Peak working set: 28 MB from a file, 5.4 MB piped (of which ~4 MB is
-the bare process), and 133 MB (x64) or 97 MB (x86) for `--rfc9535`'s tree.
-Python's `json` takes 1970 ms to reformat the same file; jq was not measured.
+- The x86 and x64 columns are the default builds, which choose AVX2 at run
+  time. The x86 figures are after the `ctz64` fix; before it, x86 took
+  48–75 ms.
+- Process spawn accounts for 3.5–4.5 ms of each run.
+- Peak working set: 28 MB from a file; 5.4 MB piped, of which ~4 MB is the
+  bare process; 133 MB (x64) or 97 MB (x86) for the `--rfc9535` tree.
+- Python's `json` takes 1970 ms to reformat the same file. jq was not
+  measured on this machine.
 
-Measure at a realistic size: at 18 KB, process spawn is 0.85 ms of a 1.05 ms
-run. A single `time cat x | json > f` measures disk writeback, not the build.
-Didn't matter: `-O3` over `-O2` (+1.8%), hand unrolling, vector `scan_ws`.
-Did: no tree (3x), batched output (+24% on string-heavy data), a memcpy fast
-path for escape-free strings (+18%).
+### How to measure
+
+- Use a realistic input size. At 18 KB, process spawn is 0.85 ms of a
+  1.05 ms run.
+- Do not time a single `time cat x | json > f`; it measures disk writeback
+  instead of the build.
+
+Measured and found irrelevant: `-O3` over `-O2` (+1.8%), hand unrolling,
+vector `scan_ws`. Measured and kept: no tree (3x), batched output (+24% on
+string-heavy data), a memcpy fast path for escape-free strings (+18%).
