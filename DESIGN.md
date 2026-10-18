@@ -23,14 +23,14 @@ change the version in this paragraph to the new tag.
 
 | proposal | section | status |
 |---|---|---|
-| Use RFC 9535 grammar and semantics for `[?...]` filters | 1 | Done, in both dialects |
+| Use RFC 9535 grammar and semantics for filters (`[?@.age > 30]`) | 1 | Done, in both dialects |
 | Defer `match`/`search` until a regex engine is worth its size | 1 | Reversed: implemented under `--rfc9535` as I-Regexp on a Pike VM; refused in the default dialect |
 | A `--rfc9535` mode that runs the compliance suite | 1 | Done: 713/713 |
 | Parse both dialects into one internal selector list | 1 | Not done: the default dialect has its own path parser, and only filters go through the RFC code |
 | Bracket-free spellings: `users.-1`, `users.1:3`, `users.@.name` | 1 | Not done: these are errors today |
 | `..` descendants and quoted names in the default dialect | 1 | Done |
 | Choose slurp or stream per input with `fstat` | 2 | Done; a regular file is read with one `read` instead of `mmap` |
-| Per-element trees for piped `[@...]` | 2 | Done (`sstream`, `stream_array`, `sfilter`) |
+| Per-element trees for piped streams (`[@.name]`) | 2 | Done (`sstream`, `stream_array`, `sfilter`) |
 | Random-access queries buffer only the array they need | 2 | Done: `[-1]` builds a tree of that whole array; there is no k-element ring buffer |
 | Forward-only skip-scan for plain paths | 2 | Done (`swalk`, `skip_value`) |
 | Pad the input buffer by 64 bytes | 3 | Rejected: the buffer is exactly the input's size, so ASan reports any read past the end (CLAUDE.md, Testing) |
@@ -47,7 +47,7 @@ RFC 9535 standardises JSONPath:
 - A query starts at `$` and is a sequence of segments: child segments
   (`.name`, `['name']`, `[0]`, `[1:3]`, `[*]`) and descendant segments
   (`..`).
-- Filters `[?…]` use `@` for the current node, comparisons, `&&`/`||`/`!`
+- Filters such as `[?@.x == 1]` use `@` for the current node, comparisons, `&&`/`||`/`!`
   and the functions `length`, `count`, `match`, `search` and `value`.
   `match` and `search` use I-Regexp (RFC 9485).
 - The result is always a *nodelist*.
@@ -62,7 +62,7 @@ The middle column is `json` at `v0.17`, when these measurements were taken.
 | | RFC 9535 | json at `v0.17` | json now |
 |---|---|---|---|
 | root | `$` required | implicit; `.a` and `a` both work | unchanged |
-| iteration | `[*]` | `[@]`, `[@.name]` | unchanged; `[*]` under `--rfc9535` |
+| iteration | `[*]` | `[@]`, `[@.name]`, `[@.a[@.b]]` | unchanged; `[*]` under `--rfc9535` |
 | glob on keys | none (only `*`) | `na+`, with `fnmatch` semantics | unchanged |
 | slice result | nodelist: one result per element | one sub-array value | unchanged; nodelist under `--rfc9535` |
 | slice step 0 | selects nothing | error, as in Python | unchanged; selects nothing under `--rfc9535` |
@@ -77,7 +77,7 @@ The middle column is `json` at `v0.17`, when these measurements were taken.
   JSONPath in a library, an API gateway or a database can read
   `$.users[*].name` without documentation, and the query behaves the same
   everywhere.
-- **The next feature already has a specification.** `[?...]` predicates
+- **The next feature already has a specification.** Filters
   were next on the roadmap. RFC 9535 defines the filter grammar, comparison
   semantics across types, the five functions and their well-typedness rules.
   Inventing our own would mean designing all of that and defending every
@@ -135,7 +135,7 @@ Adopt RFC 9535 *semantics* wherever `json` has none yet, and keep the
 shell-safe *syntax*:
 
 1. Take the filter grammar, the comparison rules and
-   `length`/`count`/`value` for `[?...]` as specified. Defer
+   `length`/`count`/`value` for filters as specified. Defer
    `match`/`search` until a regex engine is worth its size.
 2. Parse both dialects into one internal selector list. Express the real
    semantic differences as evaluation flags that `--rfc9535` sets, so that
@@ -184,7 +184,7 @@ Advantages:
 - **Pipelines need it anyway.** Multiple values on stdin (so that
   `json a[@.x] | json y` composes) means reading value after value from a
   stream that may never end.
-- **Queries can evaluate one element at a time.** A `[@...]` query can build
+- **Queries can evaluate one element at a time.** A stream such as `[@.name]` can build
   a tree of one element, then restore the arena mark before the next. That
   machinery already existed in `stream_array`; only the input side was
   missing.
@@ -239,7 +239,7 @@ Use a hybrid, chosen per input with `fstat`:
 - **Regular file:** keep the whole-buffer design and `mmap` the file. It is
   the fastest and simplest option, and the inputs people pass as files fit
   in memory.
-- **Pipe:** read incrementally for the no-query path and for `[@...]`, with
+- **Pipe:** read incrementally for the no-query path and for streams, with
   per-element trees.
 - **Random-access queries** (negative indices, reversal) buffer only the
   array they need.

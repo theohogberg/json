@@ -44,7 +44,8 @@ make bench [RUNS_BENCH=N] # against jq (on PATH), not part of ci; ~1 min
 make DEPTH=256 test       # changed flags trigger a rebuild, checked at startup
 ```
 
-Run `make ci` before every commit; it must pass. Releases are tags named
+Run `make ci` before every commit; it must pass. A commit that changes only
+documentation (`*.md`) does not need it. Releases are tags named
 `v0.N`, N being the commit count (`git rev-list --count HEAD`); a new tag
 must come with an update to DESIGN.md (see its introduction). The current
 baseline is **108/108 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
@@ -242,6 +243,21 @@ users[?@.age > 30]  filter: stream the elements (or values) that match
 a[0:3,1]  o['x','y']  union: one sub-array or sub-object, each member once
 ```
 
+**Streams and filters are the two bracket forms that yield one result per
+element.** Below, `P` stands for a path and `E` for an expression; both are
+placeholders, not syntax.
+
+- A **stream** `[@P]` runs `P` on each element of an array, or each value
+  of an object, with `@` standing for that element. `P` may be empty
+  (`[@]` yields each element itself), a member path (`[@.name]`,
+  `[@.head.name]`), or contain another stream (`[@[@]]`,
+  `[@.members[@.age]]`).
+- A **filter** `[?E]` keeps each element for which `E`, an RFC 9535
+  logical expression, is true (`[?@.age > 30]`), and runs the rest of the
+  path on it.
+
+The rest of this file and DESIGN.md say "stream" and "filter" for these.
+
 **Slices follow Python exactly**, verified case by case: negative indices,
 clamped bounds, negative steps, and `[3:1]` gives `[]`. A zero step is an
 error (RFC 9535 selects nothing instead). A slice yields one sub-array.
@@ -254,7 +270,7 @@ mismatches). There are no character classes, because `[` starts an index or
 slice. Globbing an object returns an object; globbing any other type is an
 error.
 
-**Filters `[?...]` use RFC 9535's grammar and semantics.** The RFC code
+**Filters use RFC 9535's grammar and semantics.** The RFC code
 parses and evaluates them (`path_filter`, `x_true`). Inside a filter, paths
 from `@` or `$` are JSONPath (`@.tags[0]`; the default form `@.tags.0` does
 not work there), and a missing member makes the test false instead of
@@ -290,7 +306,7 @@ for; a union never streams. A missing name or index is an error; a slice
 inside a union clamps. Names require an object and indexes an array.
 Whitespace is allowed inside brackets.
 
-**`[@...]` is meant to end a path**: `users[@.name]`, nested as `n[@[@]]`. A
+**A stream is meant to end a path**: `users[@.name]`, nested as `n[@[@]]`. A
 stream is not an object, so a `.` suffix has nothing to select from. This is
 not enforced yet: `users[@].name` still succeeds.
 
@@ -303,7 +319,7 @@ gives an empty result.
 ### `--rfc9535`
 
 With `--rfc9535` the query is RFC 9535 JSONPath: `$` is required, and it
-supports `[*]`, `..`, `['name']`, unions, and filters `[?...]` with
+supports `[*]`, `..`, `['name']`, unions, and filters (`[?@.x > 1]`) with
 `== != < <= > >=`, `&& || !` and the functions `length`, `count`, `value`,
 `match` and `search`.
 
@@ -345,7 +361,7 @@ ambiguous.
   "trailing data", so `json a[@.x] | json y` cannot compose. The window
   reduces this to a loop in `main`.
 - **Error tolerance.** `n[@.name]` fails if any element lacks `name`. jq's
-  `?` operator is the precedent. It is unrelated to RFC 9535's `[?...]`, so
+  `?` operator is the precedent. It is unrelated to RFC 9535's filters, so
   choose a spelling before implementing either.
 
 ## Testing
