@@ -57,7 +57,6 @@ the makefile:
 - sets `CC` to the first of gcc, clang and cl found on PATH;
 - switches to MSVC flags (`-std:c11 -O2 -W4`) when `CC` is `cl` or
   `clang-cl`. `check` and `fuzz` then use MSVC's ASan, which has no UBSan.
-  MinGW has no ASan at all.
 
 Recipes need a POSIX `sh`. When make runs from `cmd.exe`, it would use cmd
 as its shell; to prevent that, the makefile locates `git.exe`, takes Git for
@@ -73,7 +72,10 @@ Benchmarks).
 `argv` uses the ANSI code page, which turns a query like `$.☺` into `$.?`.
 
 Verified: `make ci` passes with MSVC 19.44 (x86) under Git Bash and GnuWin32
-make 3.81. MinGW gcc is untested.
+make 3.81.
+
+Build with each platform's native compiler: MSVC on Windows, clang or gcc on
+macOS and Linux. MinGW gcc is not a supported build.
 
 ## Rules
 
