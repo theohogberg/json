@@ -1,22 +1,48 @@
 CC     ?= cc
-CFLAGS ?= -std=c99 -O3 -Wall -Wextra -pedantic
 PREFIX ?= /usr/local
 DEPTH  ?= 1024
 RUNS   ?= 5000
 SEED   ?=
 CTS    = jsonpath-compliance-test-suite
 
-# Windows (MSYS2, MinGW and Git Bash all set OS): same targets, .exe outputs
+# Windows (MSYS2, MinGW and Git Bash all set OS): same targets, .exe outputs.
+# Recipes need a POSIX sh either way; CC defaults to the first of gcc, clang
+# and cl on PATH, so a Visual Studio developer prompt works as it is.
 ifeq ($(OS),Windows_NT)
+# From cmd.exe, make falls back to cmd as its shell when no sh.exe is on PATH:
+# borrow Git for Windows' (git.exe in Git\cmd, sh.exe in Git\usr\bin), named
+# by its 8.3 path because make splits words at the space in "Program Files"
+ifneq ($(shell echo 'x'),x)
+GITBIN := $(subst \cmd\,\usr\bin,$(shell for %%i in (git.exe) do @echo %%~sdp$$PATH:i))
+ifeq ($(wildcard $(subst \,/,$(GITBIN))/sh.exe),)
+$(error no sh.exe: run make from Git Bash or MSYS2, or install Git for Windows)
+endif
+export PATH := $(GITBIN);$(PATH)
+SHELL  := $(subst \,/,$(GITBIN))/sh.exe
+endif
 X      = .exe
+# the test scripts' Python would otherwise write cp1252
+export PYTHONUTF8 = 1
 ifeq ($(origin CC),default)
-CC     = gcc
+CC    := $(or $(shell for c in gcc clang cl; do command -v $$c >/dev/null 2>&1 && echo $$c && break; done),gcc)
 endif
 endif
 
-DEF    = -DMAXDEPTH=$(DEPTH)
+# MSVC (cl, clang-cl) has its own flags; C11 is its oldest C mode
+MSVC   = $(filter cl cl.exe clang-cl clang-cl.exe,$(notdir $(CC)))
+ifneq ($(MSVC),)
+CFLAGS ?= -nologo -std:c11 -O2 -W4
+OUT    = -Fe$@ -Fo$(basename $@).obj
+# no UBSan in MSVC; -Fd keeps each build's debug info apart under make -j
+SAN    = -nologo -std:c11 -Zi -Od -fsanitize=address -DWINDOW=7 -Fd$(basename $@).pdb
+else
+CFLAGS ?= -std=c99 -O3 -Wall -Wextra -pedantic
+OUT    = -o $@
 # a 7-byte window makes every token straddle a refill when input is piped
 SAN    = -std=c99 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -DWINDOW=7
+endif
+
+DEF    = -DMAXDEPTH=$(DEPTH)
 # the tool never frees, so the leak checker would only mask real findings
 SANENV = ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 
@@ -30,14 +56,14 @@ $(shell mkdir -p out && rm -f out/json$(X) out/json.scalar$(X) out/json.sse2$(X)
 endif
 
 out/json$(X): src/json.c src/unicat.h
-	$(CC) $(CFLAGS) $(DEF) -o $@ src/json.c
+	$(CC) $(CFLAGS) $(DEF) $(OUT) src/json.c
 out/json.scalar$(X): src/json.c src/unicat.h
-	$(CC) $(CFLAGS) $(DEF) -DNOSIMD -o $@ src/json.c
+	$(CC) $(CFLAGS) $(DEF) -DNOSIMD $(OUT) src/json.c
 # on x86, SSE2 even where the CPU has AVX2; on ARM, the same NEON build
 out/json.sse2$(X): src/json.c src/unicat.h
-	$(CC) $(CFLAGS) $(DEF) -DNOAVX2 -o $@ src/json.c
+	$(CC) $(CFLAGS) $(DEF) -DNOAVX2 $(OUT) src/json.c
 out/json.asan$(X): src/json.c src/unicat.h
-	$(CC) $(SAN) $(DEF) -o $@ src/json.c
+	$(CC) $(SAN) $(DEF) $(OUT) src/json.c
 
 test: out/json$(X)
 	JSON=$< DEPTH=$(DEPTH) sh test/test.sh

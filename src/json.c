@@ -4,6 +4,8 @@
 #define _POSIX_C_SOURCE 200809L		/* read(2) and fstat(2): libc, not C99 */
 #elif defined(__MINGW32__)
 #define __USE_MINGW_ANSI_STDIO 1	/* %zu and %lld in old msvcrt */
+#elif defined(_MSC_VER)
+#define _CRT_SECURE_NO_WARNINGS		/* C4996: strerror is C99, not unsafe */
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +17,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <io.h>
 #include <fcntl.h>
 #else
@@ -23,6 +26,7 @@
 #endif
 #ifdef _MSC_VER
 #include <intrin.h>
+#pragma comment(lib, "shell32")		/* CommandLineToArgvW; MinGW links it */
 #endif
 
 #ifndef MAXDEPTH
@@ -202,8 +206,8 @@ static void push(jval *c, const jstr *key, jval *item)
  * Guard vector code with !defined(NOSIMD) so `make scalar` tests the fallback.
  *
  * x86: SSE2, which every x86-64 has; SSE4.2's string instructions are slower
- * than this. AVX2 is used if the build targets it (-mavx2) or, with GCC or
- * clang, if the CPU reports it at run time, so one binary fits every x86-64.
+ * than this. AVX2 is used if the build targets it (-mavx2) or if the CPU
+ * reports it at run time (GCC, clang, MSVC), so one binary fits every x86-64.
  * -DNOAVX2 stops at SSE2. ARM: NEON, which every arm64 has. Either way the
  * test is one compare per byte class and a mask of the first hit.
  */
@@ -262,6 +266,14 @@ static INLINE unsigned ctz64(uint64_t m)	/* m != 0 */
 
 	_BitScanForward64(&i, m);
 	return (unsigned)i;
+#elif defined(_MSC_VER)
+	/* 32-bit x86 has no 64-bit scan; the loop below cost +50% (see CLAUDE.md) */
+	unsigned long i;
+
+	if (_BitScanForward(&i, (unsigned long)m))
+		return (unsigned)i;
+	_BitScanForward(&i, (unsigned long)(m >> 32));
+	return (unsigned)i + 32;
 #else
 	unsigned i = 0;
 
@@ -422,12 +434,28 @@ static void oflush(void);
 
 /*
  * The only OS-specific code: reading stdin, telling a file from a pipe, and
- * keeping Windows from rewriting "\n" as "\r\n" on the way out.
+ * keeping Windows from rewriting "\n" as "\r\n" on the way out, or argv into
+ * the ANSI code page, where a non-ASCII query arrives as '?'.
  */
 #ifdef _WIN32
-static void os_init(void)
+static void os_init(int *argc, char ***argv)
 {
+	wchar_t **w;
+	char **v;
+	int i, n, len;
+
 	_setmode(_fileno(stdout), _O_BINARY);
+	if (!(w = CommandLineToArgvW(GetCommandLineW(), &n)))
+		return;
+	v = xrealloc(NULL, ((size_t)n + 1) * sizeof *v);
+	for (i = 0; i < n; i++) {
+		len = WideCharToMultiByte(CP_UTF8, 0, w[i], -1, NULL, 0, NULL, NULL);
+		v[i] = xrealloc(NULL, (size_t)len);
+		WideCharToMultiByte(CP_UTF8, 0, w[i], -1, v[i], len, NULL, NULL);
+	}
+	v[n] = NULL;
+	*argc = n;
+	*argv = v;
 }
 
 /* bytes read into b, 0 at end of input */
@@ -454,9 +482,19 @@ static long long os_file_size(void)
 		return sz.QuadPart;
 	return -1;
 }
-#else
-static void os_init(void)
+
+/* after a failed write: did the reader close the pipe? (errno says EINVAL) */
+static int os_out_closed(void)
 {
+	DWORD e = GetLastError();
+
+	return e == ERROR_NO_DATA || e == ERROR_BROKEN_PIPE;
+}
+#else
+static void os_init(int *argc, char ***argv)
+{
+	(void)argc;
+	(void)argv;
 }
 
 static size_t os_read(char *b, size_t n)
@@ -480,6 +518,12 @@ static long long os_file_size(void)
 	if (fstat(0, &st) == 0 && S_ISREG(st.st_mode))
 		return (long long)st.st_size;
 	return -1;
+}
+
+/* SIGPIPE normally ends us first; this is for when it is ignored */
+static int os_out_closed(void)
+{
+	return errno == EPIPE;
 }
 #endif
 
@@ -780,13 +824,21 @@ static unsigned unescape(P *p, size_t *j)
 static char   obuf[1u << 16];
 static size_t olen;
 
+/* a reader that stops early (json ... | head) is not an error worth a word */
+static NORETURN void werr(void)
+{
+	if (os_out_closed())
+		exit(1);
+	die("write error: %s", strerror(errno));
+}
+
 static void oflush(void)
 {
 	if (olen && fwrite(obuf, 1, olen, stdout) != olen)
-		die("write error: %s", strerror(errno));
+		werr();
 	olen = 0;
 	if (fflush(stdout) != 0)
-		die("write error: %s", strerror(errno));
+		werr();
 }
 
 /* om's rare case, out of line so om inlines */
@@ -795,7 +847,7 @@ static COLD void om_slow(const char *s, size_t n)
 	oflush();
 	if (n >= sizeof obuf) {
 		if (fwrite(s, 1, n, stdout) != n)
-			die("write error: %s", strerror(errno));
+			werr();
 		return;
 	}
 	memcpy(obuf, s, n);
@@ -3439,7 +3491,7 @@ int main(int argc, char **argv)
 	P p;
 
 	simd_init();
-	os_init();
+	os_init(&argc, &argv);
 	for (i = 1; i < argc; i++) {
 		const char *a = argv[i];
 

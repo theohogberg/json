@@ -27,11 +27,20 @@ make DEPTH=256 test       # flag changes rebuild; checked when make starts
 ```
 
 On Windows the same targets work from MSYS2, MinGW or Git Bash (`OS=Windows_NT`
-adds `.exe` and defaults `CC` to gcc); `check` and `fuzz` need ASan, which
-MinGW lacks. MSVC: `cl /O2 /std:c11 src\json.c /Fe:json.exe`. The Windows
-build is written but not yet verified on Windows.
+adds `.exe`, exports `PYTHONUTF8=1`, and defaults `CC` to the first of gcc,
+clang, cl on PATH). Recipes need a POSIX `sh`: from `cmd.exe`, where make
+would fall back to cmd, the makefile finds Git for Windows' `usr\bin\sh.exe`
+via `git.exe` and puts that directory on PATH. With `cl` or `clang-cl` the
+makefile switches to MSVC flags (`-std:c11 -O2 -W4`), and `check`/`fuzz` use
+MSVC's ASan, without UBSan; MinGW has no ASan. Without make:
+`cl /O2 /std:c11 src\json.c /Fe:json.exe`. `make ci` is verified green with
+MSVC 19.44 (x86) from Git Bash and GnuWin32 make 3.81; MinGW gcc is untested.
+A Developer Command Prompt's `cl` targets 32-bit x86 by default; build from an
+x64 prompt (`vcvars64.bat`), which is ~15% faster (see Benchmarks).
+`os_init` rebuilds `argv` as UTF-8 from `GetCommandLineW`, since the CRT's
+ANSI `argv` turns a query like `$.☺` into `$.?`.
 
-`make ci` must be green before any commit. Baseline: **107/107 tests, 283/283
+`make ci` must be green before any commit. Baseline: **108/108 tests, 283/283
 conformance, 713/713 JSONPath compliance (2 skipped: NUL in the selector),
 fuzz clean**.
 
@@ -41,10 +50,12 @@ Settled decisions, not preferences. Changing one needs a reason.
 
 - **No dependencies beyond libc.** No getopt_long (GNU-only), nothing
   third-party. Option parsing is hand-rolled on purpose. The only OS calls are
-  `os_read`, `os_file_size` and `os_init`, one `#ifdef _WIN32` block: POSIX
-  `read`/`fstat` (`_POSIX_C_SOURCE` at the top) or Win32 `ReadFile`, with a
-  pipe's `ERROR_BROKEN_PIPE` as EOF and stdout set binary, since a `\r\n`
-  would break byte-identity with `jq .`.
+  `os_read`, `os_file_size`, `os_init` and `os_out_closed`, one `#ifdef _WIN32`
+  block: POSIX `read`/`fstat` (`_POSIX_C_SOURCE` at the top) or Win32
+  `ReadFile`, with a pipe's `ERROR_BROKEN_PIPE` as EOF and stdout set binary,
+  since a `\r\n` would break byte-identity with `jq .`. A reader closing the
+  pipe early (`json ... | head`) exits 1 without a message: SIGPIPE on POSIX,
+  `ERROR_NO_DATA` on Windows, where the CRT reports it as `EINVAL`.
 - **Builds clean** under `-std=c99 -O3 -Wall -Wextra -pedantic`. Fix a
   warning, don't silence it.
 - **Output is byte-identical to `jq .`** for reformatting (verified on 4.6 MB
@@ -112,18 +123,23 @@ the scalar loop would, fall through to it for the tail, and sit under
 `!defined(NOSIMD)`. Per target:
 - x86: SSE2, which every x86-64 has; SSE4.2's string instructions are slower
   for this. AVX2 takes strings past 24 bytes when the build targets it
-  (`-mavx2`) or, with GCC/clang, when `__builtin_cpu_supports` says so at run
-  time (`simd_init()`), so one binary fits every x86-64. `-DNOAVX2` stops at
-  SSE2 (`out/json.sse2`).
+  (`-mavx2`) or when the CPU reports it at run time (`simd_init()`:
+  `__builtin_cpu_supports` with GCC/clang, `__cpuid` with MSVC), so one binary
+  fits every x86-64. `-DNOAVX2` stops at SSE2 (`out/json.sse2`).
+- 32-bit x86 with MSVC: no `_BitScanForward64`, so `ctz64` takes two 32-bit
+  scans. The bit-by-bit fallback it used to hit ran on nearly every string
+  (the SWAR test below finds most closing quotes) and made the SIMD build 50%
+  slower than scalar.
 - ARM: NEON, with `vshrn` standing in for `movemask`.
 
 The first 8 bytes are a 64-bit SWAR test, not a vector: most strings are
 short keys, and NEON without it made `[@.name]` 8% *slower* than scalar.
 `scan_ws` stays scalar because a vector loop lost on both compact (1-byte
 runs) and indented input. NEON, measured: reformat −10%, long strings 2.1x,
-queries even. The x86 paths are verified under Rosetta, which runs AVX2 but
-doesn't report it, but not timed: Rosetta timings say nothing about x86
-hardware.
+queries even. x86-64, measured with MSVC on Zen 5 (see Benchmarks): SIMD over
+scalar is −7% on reformat and filters, even on queries; AVX2 is level with
+SSE2, and run-time dispatch with `/arch:AVX2`. On 32-bit x86 SIMD gains
+nothing.
 
 ## Query syntax
 
@@ -253,7 +269,8 @@ silent `exit(0)`). Each of the 76 cases is the only one catching some mutant.
 A by-judgement pass had kept 111 yet dropped six cases that were the only ones
 catching something. Error cases check only the exit code, so only the `exit(0)`
 operator tells error sites apart. The `flt-`, `desc-`, `qname-`, `union-`, `obj-` and `rfc-` cases (the `rfc-` ones cover what the compliance
-suite cannot: output format, `-r`, exact numbers) have not been through a
+suite cannot: output format, `-r`, exact numbers) and `pipe-closed` (no stderr
+when the reader quits early; only Windows can fail it) have not been through a
 mutation run yet.
 
 Add a case for every behaviour change. Known gaps: no case reaches the tree
@@ -283,6 +300,23 @@ Those predate streaming. Against the previous commit, on a 15 MB array of
 refill checks; piped 36.4 → 34.2), `5000.nested.a.b` 32 → 24 ms and
 `[@.name]` 38 → 27 ms, at 15.7 MB instead of 80 MB from a file and 1.3 MB
 piped. `jq --stream` is flat at 6.2 MB.
+
+Windows, MSVC 19.44 `-O2`, Ryzen 9 9900X, on a synthetic 23.9 MB array of
+60,000 objects (best of 15, input from a file, ms; piped is 3–4 ms faster):
+
+| | x86 | x86 scalar | x64 | x64 SSE2 | x64 scalar |
+|---|---|---|---|---|---|
+| reformat | 38.6 | 39.1 | 33.2 | 34.3 | 35.6 |
+| `5000.nested.a.b` | 29.3 | 29.3 | 27.9 | 27.0 | 28.2 |
+| `[@.name]` | 34.5 | 34.6 | 31.1 | 31.3 | 30.9 |
+| `[?@.age > 80].id` | 39.5 | 39.8 | 34.2 | 34.4 | 37.2 |
+| `--rfc9535 '$[?@.age > 80].id'` | 57.1 | 57.1 | 57.8 | 58.4 | 61.3 |
+
+x86 and x64 are the default builds (AVX2 chosen at run time); x86 is after
+the `ctz64` fix, before which it took 48–75 ms. Process spawn is 3.5–4.5 ms of
+each run. Peak working set: 28 MB from a file, 5.4 MB piped (of which ~4 MB is
+the bare process), and 133 MB (x64) or 97 MB (x86) for `--rfc9535`'s tree.
+Python's `json` takes 1970 ms to reformat the same file; jq was not measured.
 
 Measure at a realistic size: at 18 KB, process spawn is 0.85 ms of a 1.05 ms
 run. A single `time cat x | json > f` measures disk writeback, not the build.

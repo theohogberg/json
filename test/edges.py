@@ -12,7 +12,8 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-BIN = sys.argv[1] if len(sys.argv) > 1 else "out/json.asan"
+# Windows CreateProcess cannot resolve "out/json.exe": relative with a slash
+BIN = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "out/json.asan")
 d = tempfile.mkdtemp()
 paths = []
 for n in range(200):
