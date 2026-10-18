@@ -181,6 +181,17 @@ t at-desc '[1,[2]]' 0 "$(printf '1\n[\n  2\n]\n2')" '..@'
 t at-key '{"@x":1}' 0 '1' '@x'
 t at-quoted '{"a.@":1}' 0 '1' "['a.@']"
 
+# a bare -N is an index and a bare a:b:c a slice: a.-1 is a[-1]
+t bare-neg "$A" 0 '50' 'a.-1'
+t bare-slice "$A" 0 "$(printf '[\n  20,\n  30\n]')" 'a.1:3'
+t bare-step "$A" 0 "$(printf '[\n  50,\n  30,\n  10\n]')" 'a.::-2'
+t bare-root '[1,2,3]' 0 '3' -- -1
+t bare-on-obj '{"-1":1}' 1 '' -- -1
+t bare-quoted '{"-1":1}' 0 '1' "['-1']"
+t bare-desc '{"x":{"y":[1,2,3]}}' 0 '3' '..y.-1'
+t bare-in-stream '[[1,2,3],[4,5,6]]' 0 "$(printf '[\n  1,\n  2\n]\n[\n  4,\n  5\n]')" '@.0:2'
+t bare-colons "$A" 1 '' 'a.1:2:3:4'
+
 # RFC 9535 itself is held to the compliance suite (make jsonpath); these are
 # what it does not check
 R='{"a":[{"n":"x","v":1},{"n":"y","v":2.50},{"v":3}],"s":"hi","big":1e309}'

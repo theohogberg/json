@@ -49,7 +49,7 @@ documentation (`*.md`) does not need it. Releases are tags named
 `v0.N`, N being the commit count (`git rev-list --count HEAD`). Make a tag
 only when a new design has been implemented in full, and update DESIGN.md
 with it (see its introduction). The current
-baseline is **116/116 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
+baseline is **125/125 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
 because their selector contains NUL), fuzz clean**.
 
 ### Windows
@@ -234,8 +234,8 @@ also appears outside filters.
 
 ```
 users.0.name        dotted path; works on objects and arrays
-users[0]            bracket index, negative allowed: users[-1]
-users[1:3]          slice, with Python semantics
+users[0]            bracket index, negative allowed: users[-1] or users.-1
+users[1:3]          slice, with Python semantics; also users.1:3
 users.na+           glob object keys; '+' instead of '*'
 users[@.name]       stream: one result per element, or per object value
 users.@.name        the same stream without brackets, so zsh needs no quotes
@@ -254,13 +254,23 @@ placeholders, not syntax.
   (`[@]` yields each element itself), a member path (`[@.name]`,
   `[@.head.name]`), or contain another stream (`[@[@]]`,
   `[@.members[@.age]]`).
-- Without brackets, a component that is exactly `@` is a stream over the
-  rest of the path: `users.@.name` is `users[@.name]`, `n.@.@` is
-  `n[@[@]]` and `@.v` is `[@.v]`. Unlike brackets, it needs no quotes in
-  zsh. `main` rewrites it to the bracket form with `at_streams()` before
-  anything else runs, copying filters and quoted names as written. A key
-  named exactly `@` is then reachable only as `['@']`; keys such as `@id`
-  are unaffected.
+
+**Streams, negative indexes and slices also have bracket-free spellings**,
+which need no quotes in zsh. `main` rewrites them into brackets with
+`rebracket()` before anything else runs, copying filters and quoted names
+as written:
+
+- A component that is `@`, or starts with `@.` or `@[`, is a stream over
+  the rest of the path: `users.@.name` is `users[@.name]`, `n.@.@` is
+  `n[@[@]]` and `@.v` is `[@.v]`. `@id` stays a key.
+- A component of the form `-N` is always an index: `users.-1` is
+  `users[-1]`.
+- A component with one or two colons and integers is always a slice:
+  `users.1:3` is `users[1:3]`, `users.::-1` is `users[::-1]`.
+
+Keys named `@`, `-1` or `1:3` are then reachable only quoted (`['-1']`).
+A path that begins with `-`, such as `-1`, needs `--` before it, or it
+is read as an option.
 - A **filter** `[?E]` keeps each element for which `E`, an RFC 9535
   logical expression, is true (`[?@.age > 30]`), and runs the rest of the
   path on it.
@@ -401,7 +411,7 @@ catching something. Error cases check only the exit code, so only the
 `exit(0)` mutant tells error sites apart.
 
 Not yet through a mutation run: the `flt-`, `desc-`, `qname-`, `union-`,
-`obj-`, `rfc-` and `at-` cases, `pipe-closed` and `st-empty-bytes`. The
+`obj-`, `rfc-`, `at-` and `bare-` cases, `pipe-closed` and `st-empty-bytes`. The
 `rfc-` cases cover what the compliance suite cannot: output format, `-r` and
 exact numbers. `st-empty-bytes` counts bytes because `$(...)` strips the newline
 it checks for.

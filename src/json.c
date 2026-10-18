@@ -3012,13 +3012,41 @@ static int path_uses_root(const char *q)
 }
 
 /*
- * Rewrite each bare @ component as a bracketed stream: users.@.name becomes
- * users[@.name], n.@.@ becomes n[@[@]]. Filters and quoted names are copied
- * as they are. Called by main().
+ * Length of the component at s if it is a bare index or slice: -1, 1:3,
+ * ::-1. Else 0, and the component stays a key. Called by rebracket().
  */
-static const char *at_streams(const char *q)
+static size_t bare_index(const char *s)
 {
-	size_t n = strlen(q), depth = 0;
+	size_t k = 0, colons = 0;
+
+	for (;;) {
+		size_t digits = 0, neg = s[k] == '-';
+
+		k += neg;
+		while (isdig((unsigned char)s[k]))
+			k++, digits++;
+		if (neg && !digits)
+			return 0;
+		if (s[k] != ':')
+			break;
+		if (++colons > 2)
+			return 0;
+		k++;
+	}
+	if (s[k] && !strchr(".[]", s[k]))
+		return 0;
+	return colons || (k > 1 && s[0] == '-') ? k : 0;
+}
+
+/*
+ * Rewrite the bracket-free spellings into brackets: users.@.name becomes
+ * users[@.name] (a stream runs to the end of the path, so n.@.@ is
+ * n[@[@]]), users.-1 becomes users[-1] and users.1:3 users[1:3]. Filters
+ * and quoted names are copied as they are. Called by main().
+ */
+static const char *rebracket(const char *q)
+{
+	size_t n = strlen(q), depth = 0, k;
 	char *out = xrealloc(NULL, 3 * n + 1), *o = out;
 	size_t *shut = xrealloc(NULL, (n + 1) * sizeof *shut);	/* per [ */
 	const char *s = q, *end;
@@ -3030,6 +3058,15 @@ static const char *at_streams(const char *q)
 			path_filter(s, &end);
 		} else if (name && (*s == '\'' || *s == '"')) {
 			end = skip_quoted(s);
+		} else if ((s == q || s[-1] == '.') && (k = bare_index(s))) {
+			if (s > q && (s - q < 2 || s[-2] != '.'))
+				o--;			/* the '.' of a.-1, not of ..-1 */
+			*o++ = '[';
+			memcpy(o, s, k);
+			o += k;
+			*o++ = ']';
+			s += k;
+			continue;
 		} else if (*s == '@' && (s == q || s[-1] == '.') &&
 			   (s[1] == '\0' || s[1] == '.' || s[1] == '[' ||
 			    (s[1] == ']' && depth))) {
@@ -4010,6 +4047,7 @@ static void usage(void)
 "Reads JSON from stdin and prints selected or formatted values.\n"
 "\n"
 "  a.b.0  items[2]  items[-1]  items[1:3]   keys, indexes, Python slices\n"
+"  items.-1  items.1:3                      the same, without brackets\n"
 "  na+                                      '+' globs object keys\n"
 "  items[@.name]                            [@] streams elements or values\n"
 "  items.@.name                             the same, without brackets\n"
@@ -4074,7 +4112,7 @@ int main(int argc, char **argv)
 	if (rfc && filter)
 		rq = rfc_parse(filter);
 	else if (filter)
-		whole = path_uses_root(q = at_streams(filter));
+		whole = path_uses_root(q = rebracket(filter));
 
 	input(&p);
 	skipws(&p);

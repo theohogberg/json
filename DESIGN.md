@@ -15,7 +15,7 @@ benchmarks.
 
 Versions are tags named `v0.N`, where N is the number of commits up to the
 tagged one (`git rev-list --count`). The Status table and the "json now"
-column below are current as of `v0.28`. **Whenever a new tag is made, update
+column below are current as of `v0.33`. **Whenever a new tag is made, update
 this document:** bring the Status table and "json now" column up to date and
 change the version in this paragraph to the new tag.
 
@@ -27,7 +27,7 @@ change the version in this paragraph to the new tag.
 | Defer `match`/`search` until a regex engine is worth its size | 1 | Reversed: implemented under `--rfc9535` as I-Regexp on a Pike VM; refused in the default dialect |
 | A `--rfc9535` mode that runs the compliance suite | 1 | Done: 713/713 |
 | Parse both dialects into one internal selector list | 1 | Not done: the default dialect has its own path parser, and only filters go through the RFC code |
-| Bracket-free spellings: `users.-1`, `users.1:3`, `users.@.name` | 1 | `users.@.name` done (`at_streams`); `users.-1` and `users.1:3` are still errors |
+| Bracket-free spellings: `users.-1`, `users.1:3`, `users.@.name` | 1 | Done (`rebracket`): a component that is `-N` or `a:b:c` is always an index or slice, so keys such as `"-1"` need quotes (`['-1']`) |
 | `..` descendants and quoted names in the default dialect | 1 | Done |
 | Choose slurp or stream per input with `fstat` | 2 | Done; a regular file is read with one `read` instead of `mmap` |
 | Per-element trees for piped streams (`[@.name]`) | 2 | Done (`sstream`, `stream_array`, `sfilter`) |
@@ -62,9 +62,9 @@ The middle column is `json` at `v0.17`, when these measurements were taken.
 | | RFC 9535 | json at `v0.17` | json now |
 |---|---|---|---|
 | root | `$` required | implicit; `.a` and `a` both work | unchanged |
-| iteration | `[*]` | `[@]`, `[@.name]`, `[@.a[@.b]]` | unchanged; `[*]` under `--rfc9535` |
+| iteration | `[*]` | `[@]`, `[@.name]`, `[@.a[@.b]]` | also `users.@.name`; `[*]` under `--rfc9535` |
 | glob on keys | none (only `*`) | `na+`, with `fnmatch` semantics | unchanged |
-| slice result | nodelist: one result per element | one sub-array value | unchanged; nodelist under `--rfc9535` |
+| slice result | nodelist: one result per element | one sub-array value | unchanged, also as `users.1:3`; nodelist under `--rfc9535` |
 | slice step 0 | selects nothing | error, as in Python | unchanged; selects nothing under `--rfc9535` |
 | missing member | empty nodelist, success | error, exit 1 | unchanged; empty under `--rfc9535` and inside filters |
 | descendants | `..` | none | `..` |
