@@ -1,5 +1,12 @@
 /* json - format JSON from stdin, optionally selecting a value; see CLAUDE.md */
+/* POSIX or Windows (_WIN32: MSVC, MinGW, clang-cl); see os_read() */
+#ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L		/* read(2) and fstat(2): libc, not C99 */
+#elif defined(__MINGW32__)
+#define __USE_MINGW_ANSI_STDIO 1	/* %zu and %lld in old msvcrt */
+#elif defined(_MSC_VER)
+#define _CRT_SECURE_NO_WARNINGS		/* C4996: strerror is C99, not unsafe */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -7,8 +14,20 @@
 #include <errno.h>
 #include <stdint.h>
 #include <limits.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shellapi.h>
+#include <io.h>
+#include <fcntl.h>
+#else
 #include <unistd.h>
 #include <sys/stat.h>
+#endif
+#ifdef _MSC_VER
+#include <intrin.h>
+#pragma comment(lib, "shell32")		/* CommandLineToArgvW; MinGW links it */
+#endif
 
 #ifndef MAXDEPTH
 #define MAXDEPTH 1024
@@ -27,6 +46,10 @@
 #define NORETURN __attribute__((noreturn))
 #define INLINE   inline __attribute__((always_inline))
 #define COLD     __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define NORETURN __declspec(noreturn)
+#define INLINE   __forceinline
+#define COLD     __declspec(noinline)
 #else
 #define NORETURN
 #define INLINE   inline
@@ -183,8 +206,8 @@ static void push(jval *c, const jstr *key, jval *item)
  * Guard vector code with !defined(NOSIMD) so `make scalar` tests the fallback.
  *
  * x86: SSE2, which every x86-64 has; SSE4.2's string instructions are slower
- * than this. AVX2 is used if the build targets it (-mavx2) or, with GCC or
- * clang, if the CPU reports it at run time, so one binary fits every x86-64.
+ * than this. AVX2 is used if the build targets it (-mavx2) or if the CPU
+ * reports it at run time (GCC, clang, MSVC), so one binary fits every x86-64.
  * -DNOAVX2 stops at SSE2. ARM: NEON, which every arm64 has. Either way the
  * test is one compare per byte class and a mask of the first hit.
  */
@@ -198,10 +221,14 @@ static void push(jval *c, const jstr *key, jval *item)
 #define AVX2_FN
 #define have_avx2 1
 #include <immintrin.h>
-#elif defined(__GNUC__) && !defined(NOAVX2)
+#elif (defined(__GNUC__) || defined(_MSC_VER)) && !defined(NOAVX2)
 #define SIMD_AVX2
 #define SIMD_AVX2_DISPATCH
+#if defined(__GNUC__) || defined(__clang__)	/* clang-cl too */
 #define AVX2_FN __attribute__((target("avx2")))
+#else
+#define AVX2_FN				/* MSVC takes intrinsics anywhere */
+#endif
 #include <immintrin.h>
 static int have_avx2;			/* set by simd_init() */
 #endif
@@ -214,9 +241,18 @@ static int have_avx2;			/* set by simd_init() */
 
 static void simd_init(void)
 {
-#ifdef SIMD_AVX2_DISPATCH
+#if defined(SIMD_AVX2_DISPATCH) && defined(__GNUC__)
 	__builtin_cpu_init();
 	have_avx2 = __builtin_cpu_supports("avx2") != 0;
+#elif defined(SIMD_AVX2_DISPATCH)
+	/* AVX and OSXSAVE, the OS saving YMM state, then AVX2 itself */
+	int r[4];
+
+	__cpuid(r, 1);
+	if ((r[2] & (1 << 27)) && (r[2] & (1 << 28)) && (_xgetbv(0) & 6) == 6) {
+		__cpuidex(r, 7, 0);
+		have_avx2 = (r[1] >> 5) & 1;
+	}
 #endif
 }
 
@@ -225,6 +261,19 @@ static INLINE unsigned ctz64(uint64_t m)	/* m != 0 */
 {
 #if defined(__GNUC__)
 	return (unsigned)__builtin_ctzll(m);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+	unsigned long i;
+
+	_BitScanForward64(&i, m);
+	return (unsigned)i;
+#elif defined(_MSC_VER)
+	/* 32-bit x86 has no 64-bit scan; the loop below cost +50% (see CLAUDE.md) */
+	unsigned long i;
+
+	if (_BitScanForward(&i, (unsigned long)m))
+		return (unsigned)i;
+	_BitScanForward(&i, (unsigned long)(m >> 32));
+	return (unsigned)i + 32;
 #else
 	unsigned i = 0;
 
@@ -366,7 +415,7 @@ typedef struct {
 	char *s;
 	size_t n, i, cap;
 	size_t off;		/* input offset of s[0], for messages */
-	int fd;			/* -1 once the rest of the input is in s */
+	int open;		/* 0 once the rest of the input is in s */
 	int windowed;		/* s moves, so nothing may point into it */
 	int depth;
 } P;
@@ -383,12 +432,107 @@ static NORETURN void perr(P *p, const char *msg)
 
 static void oflush(void);
 
-/* read more input, keeping s[i..n); 0 at end of input */
-static int more(P *p)
+/*
+ * The only OS-specific code: reading stdin, telling a file from a pipe, and
+ * keeping Windows from rewriting "\n" as "\r\n" on the way out, or argv into
+ * the ANSI code page, where a non-ASCII query arrives as '?'.
+ */
+#ifdef _WIN32
+static void os_init(int *argc, char ***argv)
+{
+	wchar_t **w;
+	char **v;
+	int i, n, len;
+
+	_setmode(_fileno(stdout), _O_BINARY);
+	if (!(w = CommandLineToArgvW(GetCommandLineW(), &n)))
+		return;
+	v = xrealloc(NULL, ((size_t)n + 1) * sizeof *v);
+	for (i = 0; i < n; i++) {
+		len = WideCharToMultiByte(CP_UTF8, 0, w[i], -1, NULL, 0, NULL, NULL);
+		v[i] = xrealloc(NULL, (size_t)len);
+		WideCharToMultiByte(CP_UTF8, 0, w[i], -1, v[i], len, NULL, NULL);
+	}
+	v[n] = NULL;
+	*argc = n;
+	*argv = v;
+}
+
+/* bytes read into b, 0 at end of input */
+static size_t os_read(char *b, size_t n)
+{
+	DWORD got;
+
+	if (n > (size_t)1 << 30)
+		n = (size_t)1 << 30;
+	if (ReadFile(GetStdHandle(STD_INPUT_HANDLE), b, (DWORD)n, &got, NULL))
+		return got;
+	if (GetLastError() == ERROR_BROKEN_PIPE)	/* the writer is done */
+		return 0;
+	die("read: error %lu", (unsigned long)GetLastError());
+}
+
+/* stdin's size if it is a file on disk, else -1 */
+static long long os_file_size(void)
+{
+	HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+	LARGE_INTEGER sz;
+
+	if (GetFileType(h) == FILE_TYPE_DISK && GetFileSizeEx(h, &sz))
+		return sz.QuadPart;
+	return -1;
+}
+
+/* after a failed write: did the reader close the pipe? (errno says EINVAL) */
+static int os_out_closed(void)
+{
+	DWORD e = GetLastError();
+
+	return e == ERROR_NO_DATA || e == ERROR_BROKEN_PIPE;
+}
+#else
+static void os_init(int *argc, char ***argv)
+{
+	(void)argc;
+	(void)argv;
+}
+
+static size_t os_read(char *b, size_t n)
 {
 	ssize_t r;
 
-	if (p->fd < 0)
+	if (n > (size_t)1 << 30)
+		n = (size_t)1 << 30;
+	do
+		r = read(0, b, n);
+	while (r < 0 && errno == EINTR);
+	if (r < 0)
+		die("read: %s", strerror(errno));
+	return (size_t)r;
+}
+
+static long long os_file_size(void)
+{
+	struct stat st;
+
+	if (fstat(0, &st) == 0 && S_ISREG(st.st_mode))
+		return (long long)st.st_size;
+	return -1;
+}
+
+/* SIGPIPE normally ends us first; this is for when it is ignored */
+static int os_out_closed(void)
+{
+	return errno == EPIPE;
+}
+#endif
+
+/* read more input, keeping s[i..n); 0 at end of input */
+static int more(P *p)
+{
+	size_t r;
+
+	if (!p->open)
 		return 0;
 	if (p->i) {
 		memmove(p->s, p->s + p->i, p->n - p->i);
@@ -405,25 +549,18 @@ static int more(P *p)
 		 */
 		char c;
 
-		do
-			r = read(p->fd, &c, 1);
-		while (r < 0 && errno == EINTR);
-		if (r > 0) {
+		if ((r = os_read(&c, 1)) > 0) {
 			p->s = xrealloc(p->s, p->cap *= 2);
 			p->s[p->n] = c;
 		}
 	} else {
-		do
-			r = read(p->fd, p->s + p->n, p->cap - p->n);
-		while (r < 0 && errno == EINTR);
+		r = os_read(p->s + p->n, p->cap - p->n);
 	}
-	if (r < 0)
-		die("read: %s", strerror(errno));
 	if (r == 0) {
-		p->fd = -1;
+		p->open = 0;
 		return 0;
 	}
-	p->n += (size_t)r;
+	p->n += r;
 	return 1;
 }
 
@@ -433,15 +570,14 @@ static int more(P *p)
  * files stream through a window, so memory is bounded by the largest token
  * plus whatever the query keeps, not by the input.
  */
-static void input(P *p, int fd)
+static void input(P *p)
 {
-	struct stat st;
+	long long size = os_file_size();
 
 	memset(p, 0, sizeof *p);
-	p->fd = fd;
-	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
-	    (uintmax_t)st.st_size < SLURP_MAX) {
-		p->cap = st.st_size ? (size_t)st.st_size : 1;
+	p->open = 1;
+	if (size >= 0 && (unsigned long long)size < SLURP_MAX) {
+		p->cap = size ? (size_t)size : 1;
 		p->s = xrealloc(NULL, p->cap);
 		while (more(p))
 			;
@@ -688,13 +824,21 @@ static unsigned unescape(P *p, size_t *j)
 static char   obuf[1u << 16];
 static size_t olen;
 
+/* a reader that stops early (json ... | head) is not an error worth a word */
+static NORETURN void werr(void)
+{
+	if (os_out_closed())
+		exit(1);
+	die("write error: %s", strerror(errno));
+}
+
 static void oflush(void)
 {
 	if (olen && fwrite(obuf, 1, olen, stdout) != olen)
-		die("write error: %s", strerror(errno));
+		werr();
 	olen = 0;
 	if (fflush(stdout) != 0)
-		die("write error: %s", strerror(errno));
+		werr();
 }
 
 /* om's rare case, out of line so om inlines */
@@ -703,7 +847,7 @@ static COLD void om_slow(const char *s, size_t n)
 	oflush();
 	if (n >= sizeof obuf) {
 		if (fwrite(s, 1, n, stdout) != n)
-			die("write error: %s", strerror(errno));
+			werr();
 		return;
 	}
 	memcpy(obuf, s, n);
@@ -3347,6 +3491,7 @@ int main(int argc, char **argv)
 	P p;
 
 	simd_init();
+	os_init(&argc, &argv);
 	for (i = 1; i < argc; i++) {
 		const char *a = argv[i];
 
@@ -3383,7 +3528,7 @@ int main(int argc, char **argv)
 	else if (filter)
 		whole = path_uses_root(filter);
 
-	input(&p, 0);
+	input(&p);
 	skipws(&p);
 	if (rq) {			/* any node may be compared with any other */
 		root = parse_value(&p);

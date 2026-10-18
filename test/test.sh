@@ -101,7 +101,7 @@ DEPTH=${DEPTH:-1024}
 deep=$(python3 -c "print('['*($DEPTH+1) + ']'*($DEPTH+1))")
 t deep-reject "$deep" 1 ''
 ok=$(python3 -c "print('['*$DEPTH + ']'*$DEPTH)")
-t deep-accept "$ok" 0 "$(python3 -c "d=$DEPTH; print('\n'.join(['  '*i+'[' for i in range(d-1)]+['  '*(d-1)+'[]']+['  '*i+']' for i in range(d-2,-1,-1)]))")"
+t deep-accept "$ok" 0 "$(python3 -c "d=$DEPTH; print('\n'.join(['  '*i+'[' for i in range(d-1)]+['  '*(d-1)+'[]']+['  '*i+']' for i in range(d-2,-1,-1)]))" | tr -d '\r')"
 
 A='{"a":[10,20,30,40,50],"s":"hi\tthere","n":42,"o":{"x":["deep"]}}'
 t slice-clamp "$A" 0 "$(printf '[\n  10,\n  20,\n  30,\n  40,\n  50\n]')" 'a[0:99]'
@@ -183,6 +183,13 @@ t rfc-none "$R" 0 '' --rfc9535 '$.nope'
 t rfc-raw "$R" 0 'hi' -r --rfc9535 '$.s'
 t rfc-match "$R" 0 '"y"' --rfc9535 '$.a[?match(@.n, "[^x]")].n'
 t rfc-norootq "$R" 1 '' --rfc9535 'a'
+
+# a reader that stops early is not worth a message: SIGPIPE on POSIX, on
+# Windows a write that fails with ERROR_NO_DATA
+n=$((n + 1))
+err=$( { awk 'BEGIN { printf "["; for (i = 0; i < 200000; i++) printf "1,"; print "1]" }' |
+    $JSON | head -c 1 >/dev/null; } 2>&1)
+{ [ -z "$err" ] || printf 'FAIL pipe-closed: stderr %s\n' "$err"; } > "$out/$(printf '%04d' "$n")"
 
 wait
 pass=0 fail=0

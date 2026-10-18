@@ -11,7 +11,8 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-BIN = sys.argv[2] if len(sys.argv) > 2 else "out/json"
+# Windows CreateProcess cannot resolve "out/json.exe": relative with a slash
+BIN = os.path.abspath(sys.argv[2] if len(sys.argv) > 2 else "out/json")
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
 SEED = int(sys.argv[3]) if len(sys.argv) > 3 else random.randrange(2**32)
 random.seed(SEED)
