@@ -19,14 +19,14 @@ The goals, in priority order:
 1. **Correct.** Reformatted output is byte-identical to `jq .`, `--rfc9535`
    passes the JSONPath Compliance Test Suite, and the parser passes
    JSONTestSuite.
-2. **Fast.** Reformatting is ~18x faster than jq. Every change to a hot path
-   is measured (see Benchmarks).
+2. **Fast.** Reformatting is ~25x faster than jq 1.8.2 and queries 8–10x
+   (`make bench`). Every change to a hot path is measured (see Benchmarks).
 3. **Bounded memory.** Piped input is processed in a sliding window, so
    reformatting and per-element queries run in ~1.3 MB for any input
    size.
 4. **Shell-friendly.** The default query dialect avoids `$` and `*`, so
    dotted paths and `+` globs work unquoted in sh, bash and zsh. Brackets
-   still need quotes in zsh (see design.md, section 1).
+   still need quotes in zsh (see DESIGN.md, section 1).
 
 ## Build and test
 
@@ -40,11 +40,14 @@ make jsonpath             # JSONPath Compliance Test Suite (cloned on first run)
 make fuzz [SEED=N]        # differential vs Python's json; prints its seed
 make diff                 # SIMD and scalar builds must emit identical output
 make ci                   # all of the above, ~2 min; run before committing
+make bench [RUNS_BENCH=N] # against jq (on PATH), not part of ci; ~1 min
 make DEPTH=256 test       # changed flags trigger a rebuild, checked at startup
 ```
 
-Run `make ci` before every commit; it must pass. The current baseline is
-**108/108 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
+Run `make ci` before every commit; it must pass. Releases are tags named
+`v0.N`, N being the commit count (`git rev-list --count HEAD`); a new tag
+must come with an update to DESIGN.md (see its introduction). The current
+baseline is **108/108 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
 because their selector contains NUL), fuzz clean**.
 
 ### Windows
@@ -355,6 +358,7 @@ ambiguous.
 | `test/fuzz.py` | differential test against Python's `json` |
 | `test/corpus.py` | generates the input for `make diff` |
 | `test/edges.py` | `make check`: strings and whitespace of every length 0–199, ending at the file's last byte |
+| `test/bench.py` | `make bench`: generates inputs into `out/bench/`, checks json and jq print the same bytes, times both |
 
 The first three run every case twice: piped (streamed) and redirected
 (slurped). The ASan build uses `-DWINDOW=7`, so under `make check` every
@@ -401,6 +405,19 @@ The arena weakens ASan further: an overflow from one sub-allocation into the
 next is a legal write inside a live chunk.
 
 ## Benchmarks
+
+`make bench` against jq 1.8.2 on an M1 Pro (median of 15, input from a
+file; README.md has the full table, which must be updated with it):
+
+| | jq | json |
+|---|---|---|
+| reformat, 19.8 MB of 60k records | 967 ms | 39.4 ms (24.5x) |
+| `[@.name]` on the same | 324 ms | 34.0 ms (9.5x) |
+| `[?@.age > 80].id` on the same | 320 ms | 38.8 ms (8.2x) |
+| reformat, 10.9 MB nested and string-heavy | 455 ms | 15.8 ms (28.9x) |
+| reformat, 19 KB | 5.8 ms | 2.7 ms (2.2x; ~2.5 ms is process spawn) |
+
+jq peaks at ~190 MB on the 19.8 MB file, json at 20 MB (the slurped input).
 
 Against jq 1.7.1 on a 4.6 MB array of 15,840 objects, output byte-identical
 (measured before streaming input existed):

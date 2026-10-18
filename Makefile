@@ -2,6 +2,7 @@ CC     ?= cc
 PREFIX ?= /usr/local
 DEPTH  ?= 1024
 RUNS   ?= 5000
+RUNS_BENCH ?= 15
 SEED   ?=
 CTS    = jsonpath-compliance-test-suite
 
@@ -89,6 +90,10 @@ diff: out/json$(X) out/json.scalar$(X) out/json.sse2$(X)
 
 ci: test scalar check fuzz conformance jsonpath diff
 
+# against jq, which must be on PATH; not part of ci
+bench: out/json$(X)
+	python3 test/bench.py $< $(RUNS_BENCH)
+
 JSONTestSuite:
 	git clone --depth 1 https://github.com/nst/JSONTestSuite.git
 $(CTS):
@@ -102,4 +107,4 @@ uninstall:
 clean:
 	rm -rf out
 
-.PHONY: all test scalar conformance jsonpath check fuzz diff ci install uninstall clean
+.PHONY: all test scalar conformance jsonpath check fuzz diff ci bench install uninstall clean

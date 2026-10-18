@@ -6,12 +6,18 @@ This file records the analysis behind three decisions in `json`:
 2. whether to stream input or read the whole document;
 3. how SIMD intrinsics fit each way of reading input.
 
-The analysis was written at `4278d00`. Its measurements were taken at
-`694d744` on arm64 macOS (8 cores, Apple clang 17) unless marked as an
+The analysis was written at `v0.18`. Its measurements were taken at
+`v0.17` on arm64 macOS (8 cores, Apple clang 17) unless marked as an
 estimate. The test file is a 12.1 MB array of 60,000 API-shaped objects.
 Most proposals have since been implemented, and the numbers in sections 1–3
 predate that work. CLAUDE.md describes the current design and has current
 benchmarks.
+
+Versions are tags named `v0.N`, where N is the number of commits up to the
+tagged one (`git rev-list --count`). The Status table and the "json now"
+column below are current as of `v0.28`. **Whenever a new tag is made, update
+this document:** bring the Status table and "json now" column up to date and
+change the version in this paragraph to the new tag.
 
 ## Status
 
@@ -51,9 +57,9 @@ RFC 9535 standardises JSONPath:
 
 ### How json differed
 
-The middle column is `json` at `694d744`, when this analysis was written.
+The middle column is `json` at `v0.17`, when these measurements were taken.
 
-| | RFC 9535 | json at `694d744` | json now |
+| | RFC 9535 | json at `v0.17` | json now |
 |---|---|---|---|
 | root | `$` required | implicit; `.a` and `a` both work | unchanged |
 | iteration | `[*]` | `[@]`, `[@.name]` | unchanged; `[*]` under `--rfc9535` |
@@ -143,7 +149,7 @@ shell-safe *syntax*:
 
 ## 2. Streaming versus reading the whole document
 
-Streaming and reading are two separate axes. At `694d744`, `json` used one
+Streaming and reading are two separate axes. At `v0.17`, `json` used one
 corner of each:
 
 | | read incrementally | read to EOF (`slurp`) |
@@ -245,7 +251,7 @@ intrinsics, so do it before any of them.
 
 ## 3. Using SIMD intrinsics
 
-**State at `694d744`.** `scan_str` and `scan_ws` were scalar loops behind an
+**State at `v0.17`.** `scan_str` and `scan_ws` were scalar loops behind an
 interface that intrinsics could fill. Their contract: read only `s[0..n)`
 and return what the scalar loop would. `-DNOSIMD` forces the scalar code,
 and `make scalar` and `make diff` keep both paths tested.
@@ -356,7 +362,7 @@ the buffer. Incremental input is therefore compatible with SIMD. It adds:
 Measure after each step, and drop any step that does not pay for itself.
 
 1. Pad the input buffer by 64 bytes and widen the scanner contract.
-2. SSE2 and NEON `scan_str` (the old SSE2 code is in `git show 04a1c92`).
+2. SSE2 and NEON `scan_str` (the old SSE2 code is in `git show v0.13`).
 3. Vectorised UTF-8 validation inside `scan_str`'s non-ASCII branch.
 4. Forward-only skip-scan for plain paths. It needs no intrinsics and gives
    the largest memory reduction for queries.
