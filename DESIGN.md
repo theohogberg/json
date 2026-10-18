@@ -27,7 +27,7 @@ change the version in this paragraph to the new tag.
 | Defer `match`/`search` until a regex engine is worth its size | 1 | Reversed: implemented under `--rfc9535` as I-Regexp on a Pike VM; refused in the default dialect |
 | A `--rfc9535` mode that runs the compliance suite | 1 | Done: 713/713 |
 | Parse both dialects into one internal selector list | 1 | Not done: the default dialect has its own path parser, and only filters go through the RFC code |
-| Bracket-free spellings: `users.-1`, `users.1:3`, `users.@.name` | 1 | Not done: these are errors today |
+| Bracket-free spellings: `users.-1`, `users.1:3`, `users.@.name` | 1 | `users.@.name` done (`at_streams`); `users.-1` and `users.1:3` are still errors |
 | `..` descendants and quoted names in the default dialect | 1 | Done |
 | Choose slurp or stream per input with `fstat` | 2 | Done; a regular file is read with one `read` instead of `mmap` |
 | Per-element trees for piped streams (`[@.name]`) | 2 | Done (`sstream`, `stream_array`, `sfilter`) |

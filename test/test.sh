@@ -172,6 +172,15 @@ t union-mixed "$D" 1 '' "arr['x',0]"
 t obj-stream "$D" 0 "$(printf 'cy\ndi')" -r 'm[@.name]'
 t obj-filter "$D" 0 'cy' -r 'm[?@.age > 30].name'
 
+# a bare @ component is a stream: a.@.b is a[@.b]
+t at-stream "$D" 0 "$(printf 'cy\ndi')" -r 'm.@.name'
+t at-root '[{"v":1},{"v":2}]' 0 "$(printf '1\n2')" '@.v'
+t at-nested "$S" 0 "$(printf '1\n2\n3\n4')" 'n.@.@'
+t at-inner "$S" 0 "$(printf '1\n2\n3\n4')" 'n[@.@]'
+t at-desc '[1,[2]]' 0 "$(printf '1\n[\n  2\n]\n2')" '..@'
+t at-key '{"@x":1}' 0 '1' '@x'
+t at-quoted '{"a.@":1}' 0 '1' "['a.@']"
+
 # RFC 9535 itself is held to the compliance suite (make jsonpath); these are
 # what it does not check
 R='{"a":[{"n":"x","v":1},{"n":"y","v":2.50},{"v":3}],"s":"hi","big":1e309}'

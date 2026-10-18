@@ -49,7 +49,7 @@ documentation (`*.md`) does not need it. Releases are tags named
 `v0.N`, N being the commit count (`git rev-list --count HEAD`). Make a tag
 only when a new design has been implemented in full, and update DESIGN.md
 with it (see its introduction). The current
-baseline is **109/109 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
+baseline is **116/116 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
 because their selector contains NUL), fuzz clean**.
 
 ### Windows
@@ -238,6 +238,7 @@ users[0]            bracket index, negative allowed: users[-1]
 users[1:3]          slice, with Python semantics
 users.na+           glob object keys; '+' instead of '*'
 users[@.name]       stream: one result per element, or per object value
+users.@.name        the same stream without brackets, so zsh needs no quotes
 users[?@.age > 30]  filter: stream the elements (or values) that match
 ..id  a..name       search every depth: ..key, ..['k'], ..[n], ..[@], ..[?]
 ['a.b']  ["x y"]    quoted name: any key, including '.', '[' and '+'
@@ -253,6 +254,13 @@ placeholders, not syntax.
   (`[@]` yields each element itself), a member path (`[@.name]`,
   `[@.head.name]`), or contain another stream (`[@[@]]`,
   `[@.members[@.age]]`).
+- Without brackets, a component that is exactly `@` is a stream over the
+  rest of the path: `users.@.name` is `users[@.name]`, `n.@.@` is
+  `n[@[@]]` and `@.v` is `[@.v]`. Unlike brackets, it needs no quotes in
+  zsh. `main` rewrites it to the bracket form with `at_streams()` before
+  anything else runs, copying filters and quoted names as written. A key
+  named exactly `@` is then reachable only as `['@']`; keys such as `@id`
+  are unaffected.
 - A **filter** `[?E]` keeps each element for which `E`, an RFC 9535
   logical expression, is true (`[?@.age > 30]`), and runs the rest of the
   path on it.
@@ -393,9 +401,9 @@ catching something. Error cases check only the exit code, so only the
 `exit(0)` mutant tells error sites apart.
 
 Not yet through a mutation run: the `flt-`, `desc-`, `qname-`, `union-`,
-`obj-` and `rfc-` cases, `pipe-closed` and `st-empty-bytes`. The `rfc-`
-cases cover what the compliance suite cannot: output format, `-r` and exact
-numbers. `st-empty-bytes` counts bytes because `$(...)` strips the newline
+`obj-`, `rfc-` and `at-` cases, `pipe-closed` and `st-empty-bytes`. The
+`rfc-` cases cover what the compliance suite cannot: output format, `-r` and
+exact numbers. `st-empty-bytes` counts bytes because `$(...)` strips the newline
 it checks for.
 `pipe-closed` checks that nothing reaches stderr when the reader quits
 early; only a Windows build can fail it.

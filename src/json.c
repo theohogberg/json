@@ -3011,6 +3011,62 @@ static int path_uses_root(const char *q)
 	return root;
 }
 
+/*
+ * Rewrite each bare @ component as a bracketed stream: users.@.name becomes
+ * users[@.name], n.@.@ becomes n[@[@]]. Filters and quoted names are copied
+ * as they are. Called by main().
+ */
+static const char *at_streams(const char *q)
+{
+	size_t n = strlen(q), depth = 0;
+	char *out = xrealloc(NULL, 3 * n + 1), *o = out;
+	size_t *shut = xrealloc(NULL, (n + 1) * sizeof *shut);	/* per [ */
+	const char *s = q, *end;
+	int name = 0;
+
+	shut[0] = 0;
+	while (*s) {
+		if (s[0] == '[' && s[1] == '?') {
+			path_filter(s, &end);
+		} else if (name && (*s == '\'' || *s == '"')) {
+			end = skip_quoted(s);
+		} else if (*s == '@' && (s == q || s[-1] == '.') &&
+			   (s[1] == '\0' || s[1] == '.' || s[1] == '[' ||
+			    (s[1] == ']' && depth))) {
+			if (s > q && (s - q < 2 || s[-2] != '.'))
+				o--;			/* the '.' of a.@, not of ..@ */
+			*o++ = '[';
+			*o++ = '@';
+			shut[depth]++;
+			s++;
+			continue;
+		} else {
+			if (*s == '[')
+				shut[++depth] = 0;
+			if (*s == ']' && depth)
+				for (; shut[depth]; shut[depth]--)
+					*o++ = ']';
+			depth -= *s == ']' && depth;
+			if (!isblank_(*s))
+				name = *s == '[' || *s == ',';
+			*o++ = *s++;
+			continue;
+		}
+		memcpy(o, s, (size_t)(end - s));
+		o += end - s;
+		s = end;
+		name = 0;
+	}
+	for (;; depth--) {
+		for (; shut[depth]; shut[depth]--)
+			*o++ = ']';
+		if (!depth)
+			break;
+	}
+	*o = '\0';
+	return out;
+}
+
 /* exact decimal comparison of two number lexemes: <0, 0 or >0 */
 typedef struct {
 	const char *d[2];	/* digits: the integer part, then the fraction */
@@ -3956,6 +4012,7 @@ static void usage(void)
 "  a.b.0  items[2]  items[-1]  items[1:3]   keys, indexes, Python slices\n"
 "  na+                                      '+' globs object keys\n"
 "  items[@.name]                            [@] streams elements or values\n"
+"  items.@.name                             the same, without brackets\n"
 "  items[?@.n > 1].name                     [?] streams those that match\n"
 "  ..id  a..name  ..[?@.x]                  .. searches every depth\n"
 "  ['a.b']  items[0,2]  o['x','y']          quoted names; unions, each once\n"
@@ -3975,7 +4032,7 @@ static void usage(void)
  */
 int main(int argc, char **argv)
 {
-	const char *filter = NULL;
+	const char *filter = NULL, *q = NULL;
 	int i, endopts = 0, rfc = 0, nout = 0, whole = 0;
 	rquery *rq = NULL;
 	jval *root;
@@ -4017,7 +4074,7 @@ int main(int argc, char **argv)
 	if (rfc && filter)
 		rq = rfc_parse(filter);
 	else if (filter)
-		whole = path_uses_root(filter);
+		whole = path_uses_root(q = at_streams(filter));
 
 	input(&p);
 	skipws(&p);
@@ -4038,9 +4095,9 @@ int main(int argc, char **argv)
 		skipws(&p);
 		if (p.i != p.n)
 			perr(&p, "trailing data after JSON value");
-		walk(doc_root, filter, filter, print_sink, &nout, 0);
+		walk(doc_root, q, filter, print_sink, &nout, 0);
 	} else if (filter)
-		swalk(&p, filter, filter, &nout, 0);
+		swalk(&p, q, filter, &nout, 0);
 	else if (opt_raw && peek(&p) == '"')	/* decoded, so through a tree */
 		print_sink(parse_value(&p), &nout);
 	else

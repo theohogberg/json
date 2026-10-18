@@ -46,6 +46,7 @@ curl -s URL | json users.0.name          # select one value
 curl -s URL | json 'users[-1]'           # negative index
 curl -s URL | json 'users[1:3]'          # slice (Python semantics)
 curl -s URL | json -r 'users[@.name]'    # one result per element, unquoted
+curl -s URL | json -r users.@.name       # the same, without brackets
 curl -s URL | json 'users[?@.age > 30]'  # filter
 curl -s URL | json ..id                  # search every depth
 curl -s URL | json --rfc9535 '$.users[?@.age > 30].name'
