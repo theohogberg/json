@@ -48,7 +48,7 @@ Run `make ci` before every commit; it must pass. A commit that changes only
 documentation (`*.md`) does not need it. Releases are tags named
 `v0.N`, N being the commit count (`git rev-list --count HEAD`); a new tag
 must come with an update to DESIGN.md (see its introduction). The current
-baseline is **108/108 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
+baseline is **109/109 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
 because their selector contains NUL), fuzz clean**.
 
 ### Windows
@@ -392,8 +392,10 @@ catching something. Error cases check only the exit code, so only the
 `exit(0)` mutant tells error sites apart.
 
 Not yet through a mutation run: the `flt-`, `desc-`, `qname-`, `union-`,
-`obj-` and `rfc-` cases, and `pipe-closed`. The `rfc-` cases cover what the
-compliance suite cannot: output format, `-r` and exact numbers.
+`obj-` and `rfc-` cases, `pipe-closed` and `st-empty-bytes`. The `rfc-`
+cases cover what the compliance suite cannot: output format, `-r` and exact
+numbers. `st-empty-bytes` counts bytes because `$(...)` strips the newline
+it checks for.
 `pipe-closed` checks that nothing reaches stderr when the reader quits
 early; only a Windows build can fail it.
 

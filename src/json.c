@@ -3463,7 +3463,7 @@ static void usage(void)
 {
 	puts("usage: json [options] [path]\n"
 "\n"
-"Reads JSON on stdin and prints it formatted, or the selected value.\n"
+"Reads JSON from stdin and prints selected or formatted values.\n"
 "\n"
 "  a.b.0  items[2]  items[-1]  items[1:3]   keys, indexes, Python slices\n"
 "  na+                                      '+' globs object keys\n"
@@ -3555,7 +3555,8 @@ int main(int argc, char **argv)
 	skipws(&p);
 	if (p.i != p.n)
 		perr(&p, "trailing data after JSON value");
-	oc('\n');
+	if (nout || !filter)		/* an empty stream prints nothing */
+		oc('\n');
 	oflush();
 	return 0;
 }

@@ -184,6 +184,12 @@ t rfc-raw "$R" 0 'hi' -r --rfc9535 '$.s'
 t rfc-match "$R" 0 '"y"' --rfc9535 '$.a[?match(@.n, "[^x]")].n'
 t rfc-norootq "$R" 1 '' --rfc9535 'a'
 
+# an empty stream prints no bytes at all; $(...) in run() would strip the
+# newline this checks for
+n=$((n + 1))
+got=$(printf '[]' | $JSON '[@]' | wc -c | tr -d ' ')
+{ [ "$got" = 0 ] || printf 'FAIL st-empty-bytes: %s bytes, want 0\n' "$got"; } > "$out/$(printf '%04d' "$n")"
+
 # a reader that stops early is not worth a message: SIGPIPE on POSIX, on
 # Windows a write that fails with ERROR_NO_DATA
 n=$((n + 1))

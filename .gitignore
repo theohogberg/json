@@ -3,3 +3,4 @@ out/
 JSONTestSuite/
 tags
 jsonpath-compliance-test-suite/
+local/
