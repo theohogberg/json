@@ -254,6 +254,11 @@ placeholders, not syntax.
   (`[@]` yields each element itself), a member path (`[@.name]`,
   `[@.head.name]`), or contain another stream (`[@[@]]`,
   `[@.members[@.age]]`).
+- A **filter** `[?E]` keeps each element for which `E`, an RFC 9535
+  logical expression, is true (`[?@.age > 30]`), and runs the rest of the
+  path on it.
+
+The rest of this file and DESIGN.md say "stream" and "filter" for these.
 
 **Streams, negative indexes and slices also have bracket-free spellings**,
 which need no quotes in zsh. `main` rewrites them into brackets with
@@ -271,11 +276,6 @@ as written:
 Keys named `@`, `-1` or `1:3` are then reachable only quoted (`['-1']`).
 A path that begins with `-`, such as `-1`, needs `--` before it, or it
 is read as an option.
-- A **filter** `[?E]` keeps each element for which `E`, an RFC 9535
-  logical expression, is true (`[?@.age > 30]`), and runs the rest of the
-  path on it.
-
-The rest of this file and DESIGN.md say "stream" and "filter" for these.
 
 **Slices follow Python exactly**, verified case by case: negative indices,
 clamped bounds, negative steps, and `[3:1]` gives `[]`. A zero step is an
