@@ -26,6 +26,7 @@ change the version in this paragraph to the new tag.
 | Use RFC 9535 grammar and semantics for filters (`[?@.age > 30]`) | 1 | Done, in both dialects |
 | Defer `match`/`search` until a regex engine is worth its size | 1 | Reversed: implemented under `--rfc9535` as I-Regexp on a Pike VM; the default dialect refuses them and has `@.x ~ /re/` (a search; `^` and `$` anchor) on the same engine |
 | A `--rfc9535` mode that runs the compliance suite | 1 | Done: 713/713 |
+| Case-insensitive `~ /re/i` | 1 | Not done, deferred: `[Hh]` classes cover it. Plan: rewrite each letter of the pattern into its Unicode simple-case-folding class (`/σ/i` becomes `[Σσς]`), from a table generated like `src/unicat.h`; scripts without case are unchanged. jq (Oniguruma) folds fully, so its `ß` also matches `ss`; a pattern rewrite cannot, as that needs folding the input in `re_run()`. Neither pairs Turkish `İ`/`ı` with `i`/`I` |
 | Parse both dialects into one internal selector list | 1 | Not done: the default dialect has its own path parser, and only filters go through the RFC code |
 | Bracket-free spellings: `users.-1`, `users.1:3`, `users.@.name` | 1 | Done (`rebracket`): a component that is `-N` or `a:b:c` is always an index or slice, so keys such as `"-1"` need quotes (`['-1']`) |
 | `..` descendants and quoted names in the default dialect | 1 | Done |
