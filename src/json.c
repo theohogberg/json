@@ -1,9 +1,9 @@
 /* json - format JSON from stdin, optionally selecting a value; see CLAUDE.md */
 /* POSIX or Windows (_WIN32: MSVC, clang-cl); see os_read() */
 #ifndef _WIN32
-#define _POSIX_C_SOURCE 200809L		/* read(2) and fstat(2): libc, not C99 */
+#define _POSIX_C_SOURCE 200809L		/* read(2), fstat(2): POSIX */
 #elif defined(_MSC_VER)
-#define _CRT_SECURE_NO_WARNINGS		/* C4996: strerror is C99, not unsafe */
+#define _CRT_SECURE_NO_WARNINGS		/* C4996 flags strerror, which is C99 */
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +56,7 @@
 
 static int opt_raw;
 
+/* Print "json: " and the message to stderr, then exit(1). */
 static NORETURN void die(const char *fmt, ...)
 {
 	va_list ap;
@@ -68,6 +69,10 @@ static NORETURN void die(const char *fmt, ...)
 	exit(1);
 }
 
+/*
+ * realloc() that calls die() when memory runs out, for buffers outside the
+ * arena.
+ */
 static void *xrealloc(void *p, size_t n)
 {
 	p = realloc(p, n);
@@ -76,6 +81,7 @@ static void *xrealloc(void *p, size_t n)
 	return p;
 }
 
+/* ASCII digit test. */
 static int isdig(int c) { return c >= '0' && c <= '9'; }
 
 /* bump allocator: kept chunks make arena_restore() O(1), and get reused */
@@ -95,18 +101,30 @@ typedef struct {
 static chunk *arena_head, *arena_cur;
 static size_t arena_off;
 
+/*
+ * The current arena position, for arena_restore(). Taken before each element
+ * so its allocations can be dropped.
+ */
 static amark arena_save(void)
 {
 	amark m = { arena_cur, arena_off };
 	return m;
 }
 
+/*
+ * Rewind arena_alloc() to a mark from arena_save(); the chunks after it are
+ * reused.
+ */
 static void arena_restore(amark m)
 {
 	arena_cur = m.c;
 	arena_off = m.off;
 }
 
+/*
+ * Bump-allocate n bytes, rounded up to 8, linking a new chunk when the
+ * current one is full. 8 keeps a jval at 40 bytes; 16 padded it to 48.
+ */
 static void *arena_alloc(size_t n)
 {
 	void *p;
@@ -133,6 +151,7 @@ static void *arena_alloc(size_t n)
 	return p;
 }
 
+/* arena_alloc(), zeroed. */
 static void *arena_zalloc(size_t n)
 {
 	return memset(arena_alloc(n), 0, n);
@@ -155,6 +174,7 @@ struct jval {
 	} u;
 };
 
+/* The name of a jtype for die() messages. */
 static const char *typename(jtype t)
 {
 	static const char *const names[] = {
@@ -163,6 +183,7 @@ static const char *typename(jtype t)
 	return names[t];
 }
 
+/* A jval of type t from arena_zalloc(); a container starts with no members. */
 static jval *newval(jtype t)
 {
 	jval *v = arena_zalloc(sizeof *v);
@@ -171,7 +192,11 @@ static jval *newval(jtype t)
 	return v;
 }
 
-/* growth abandons the old block: fine per query, too wasteful for the tree */
+/*
+ * Copy oldn elements into a new arena block of newn. The old block stays
+ * allocated, so parse_container() calls it once per container, at the final
+ * size.
+ */
 static void *arena_grow(const void *old, size_t oldn, size_t newn, size_t esz)
 {
 	void *p = arena_alloc(newn * esz);
@@ -181,7 +206,10 @@ static void *arena_grow(const void *old, size_t oldn, size_t newn, size_t esz)
 	return p;
 }
 
-/* key is NULL for arrays */
+/*
+ * Append a member to c, doubling with arena_grow(); key is NULL for arrays.
+ * Called by apply_key() and take().
+ */
 static void push(jval *c, const jstr *key, jval *item)
 {
 	if (c->u.c.n == c->u.c.cap) {
@@ -237,6 +265,10 @@ static int have_avx2;			/* set by simd_init() */
 #endif
 #endif
 
+/*
+ * Set have_avx2 from the CPU (__builtin_cpu_supports() or __cpuid()), for
+ * scan_str(). Called by main().
+ */
 static void simd_init(void)
 {
 #if defined(SIMD_AVX2_DISPATCH) && defined(__GNUC__)
@@ -255,6 +287,10 @@ static void simd_init(void)
 }
 
 #if defined(SIMD_SSE2) || defined(SIMD_NEON)
+/*
+ * Index of the lowest set bit, to locate the first hit in a mask. 32-bit
+ * MSVC uses two 32-bit scans.
+ */
 static INLINE unsigned ctz64(uint64_t m)	/* m != 0 */
 {
 #if defined(__GNUC__)
@@ -285,7 +321,10 @@ static INLINE unsigned ctz64(uint64_t m)	/* m != 0 */
 #endif
 
 #ifdef SIMD_NEON
-/* one bit in four per byte of a 0x00/0xFF mask, as there is no movemask */
+/*
+ * Pack a NEON 0x00/0xFF byte mask into 4 bits per byte with vshrn, as x86's
+ * movemask does in 1; the caller divides ctz64() by 4. Called by scan_str().
+ */
 static INLINE uint64_t neon_mask(uint8x16_t m)
 {
 	return vget_lane_u64(vreinterpret_u64_u8(
@@ -294,7 +333,11 @@ static INLINE uint64_t neon_mask(uint8x16_t m)
 #endif
 
 #ifdef SIMD_AVX2
-/* scan_str 32 bytes at a time from i; the hit, or (size_t)-1 if none */
+/*
+ * scan_str()'s vector loop, 32 bytes at a time from i, for strings past 24
+ * bytes. Returns the hit's index, or (size_t)-1 if s[i..n) has none. Called
+ * by scan_str().
+ */
 static AVX2_FN size_t scan_str_avx2(const char *s, size_t n, size_t i)
 {
 	const __m256i q = _mm256_set1_epi8('"'), b = _mm256_set1_epi8('\\');
@@ -314,7 +357,12 @@ static AVX2_FN size_t scan_str_avx2(const char *s, size_t n, size_t i)
 }
 #endif
 
-/* first quote, backslash, control or non-ASCII byte in s[0..n), else n */
+/*
+ * Index of the first quote, backslash, control or non-ASCII byte in s[0..n),
+ * else n. Tests 8 bytes as one word, then 16 at a time with SSE2 or NEON
+ * (scan_str_avx2() for long strings), then a scalar tail. Called by
+ * str_end().
+ */
 static INLINE size_t scan_str(const char *s, size_t n)
 {
 	size_t i = 0;
@@ -391,8 +439,9 @@ static INLINE size_t scan_str(const char *s, size_t n)
 }
 
 /*
- * Scalar on purpose: whitespace runs are 0-1 bytes in compact input and
- * 5-13 indented, and a vector loop was slower on both (NEON, 15-25 MB).
+ * Length of the whitespace run at s[0..n). Scalar: runs are 0-1 bytes in
+ * compact input and 5-13 indented, and a NEON loop measured slower on both.
+ * Called by skipws().
  */
 static size_t scan_ws(const char *s, size_t n)
 {
@@ -418,11 +467,16 @@ typedef struct {
 	int depth;
 } P;
 
+/*
+ * die() with the byte offset p->off + p->i + k; p->off counts the bytes
+ * more() has slid out of the window.
+ */
 static NORETURN void perr_at(P *p, size_t k, const char *msg)
 {
 	die("parse error at byte %zu: %s", p->off + p->i + k, msg);
 }
 
+/* perr_at() at the current byte. */
 static NORETURN void perr(P *p, const char *msg)
 {
 	perr_at(p, 0, msg);
@@ -436,6 +490,11 @@ static void oflush(void);
  * the ANSI code page, where a non-ASCII query arrives as '?'.
  */
 #ifdef _WIN32
+/*
+ * Windows: set stdout to binary, so "\n" is written as jq writes it, and
+ * rebuild argv as UTF-8 from GetCommandLineW(); the CRT's argv uses the ANSI
+ * code page, which turns non-ASCII into '?'. Called by main().
+ */
 static void os_init(int *argc, char ***argv)
 {
 	wchar_t **w;
@@ -456,7 +515,10 @@ static void os_init(int *argc, char ***argv)
 	*argv = v;
 }
 
-/* bytes read into b, 0 at end of input */
+/*
+ * Windows: ReadFile() on stdin, at most 1 GiB; returns 0 at end of input,
+ * which includes ERROR_BROKEN_PIPE. Called by more().
+ */
 static size_t os_read(char *b, size_t n)
 {
 	DWORD got;
@@ -470,7 +532,10 @@ static size_t os_read(char *b, size_t n)
 	die("read: error %lu", (unsigned long)GetLastError());
 }
 
-/* stdin's size if it is a file on disk, else -1 */
+/*
+ * Windows: stdin's size when GetFileType() reports a disk file, else -1.
+ * Called by input().
+ */
 static long long os_file_size(void)
 {
 	HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
@@ -481,7 +546,10 @@ static long long os_file_size(void)
 	return -1;
 }
 
-/* after a failed write: did the reader close the pipe? (errno says EINVAL) */
+/*
+ * Windows: after a failed write, 1 if the reader closed the pipe
+ * (ERROR_NO_DATA, which errno reports as EINVAL). Called by werr().
+ */
 static int os_out_closed(void)
 {
 	DWORD e = GetLastError();
@@ -489,12 +557,17 @@ static int os_out_closed(void)
 	return e == ERROR_NO_DATA || e == ERROR_BROKEN_PIPE;
 }
 #else
+/*
+ * POSIX version of os_init(): stdout is already binary and argv already
+ * bytes, so it does nothing. Called by main().
+ */
 static void os_init(int *argc, char ***argv)
 {
 	(void)argc;
 	(void)argv;
 }
 
+/* POSIX version of os_read(): read(2), retried on EINTR. Called by more(). */
 static size_t os_read(char *b, size_t n)
 {
 	ssize_t r;
@@ -509,6 +582,10 @@ static size_t os_read(char *b, size_t n)
 	return (size_t)r;
 }
 
+/*
+ * POSIX version of os_file_size(): fstat(2), with a size only for S_ISREG.
+ * Called by input().
+ */
 static long long os_file_size(void)
 {
 	struct stat st;
@@ -518,14 +595,22 @@ static long long os_file_size(void)
 	return -1;
 }
 
-/* SIGPIPE normally ends us first; this is for when it is ignored */
+/*
+ * POSIX version of os_out_closed(): tests errno for EPIPE, for when SIGPIPE
+ * is ignored. Called by werr().
+ */
 static int os_out_closed(void)
 {
 	return errno == EPIPE;
 }
 #endif
 
-/* read more input, keeping s[i..n); 0 at end of input */
+/*
+ * Move s[i..n) to the front, oflush() pending output, then os_read() more; 0
+ * at end of input. A full buffer doubles only after a 1-byte read finds more
+ * input, so a slurped buffer stays exactly the file's size for ASan. Called
+ * by avail(), input(), scan_number() and skipws().
+ */
 static int more(P *p)
 {
 	size_t r;
@@ -563,10 +648,9 @@ static int more(P *p)
 }
 
 /*
- * The heuristic: a regular file of known, moderate size is slurped in one
- * read, so the tree may point into it. Pipes, terminals, sockets and huge
- * files stream through a window, so memory is bounded by the largest token
- * plus whatever the query keeps, not by the input.
+ * Set up P. A regular file under SLURP_MAX (os_file_size()) is read whole,
+ * so the tree may point into it; any other input gets a WINDOW-sized buffer
+ * that more() slides. Called by main().
  */
 static void input(P *p)
 {
@@ -586,7 +670,7 @@ static void input(P *p)
 	}
 }
 
-/* bytes unread, refilling until there are k or the input ends */
+/* more() until k bytes are unread or input ends; returns the unread count. */
 static size_t avail(P *p, size_t k)
 {
 	while (p->n - p->i < k && more(p))
@@ -594,7 +678,10 @@ static size_t avail(P *p, size_t k)
 	return p->n - p->i;
 }
 
-/* past whitespace; the window then holds a byte unless the input is over */
+/*
+ * Skip whitespace with scan_ws(), refilling with more(); afterwards peek()
+ * has a byte unless input has ended.
+ */
 static void skipws(P *p)
 {
 	do
@@ -602,12 +689,17 @@ static void skipws(P *p)
 	while (p->i == p->n && more(p));
 }
 
-/* only after skipws(), so it never needs to refill */
+/* The byte at i, or -1 at end of input; valid after skipws(). */
 static int peek(P *p)
 {
 	return p->i < p->n ? (unsigned char)p->s[p->i] : -1;
 }
 
+/*
+ * Match true, false or null at i, getting enough bytes with avail() first;
+ * perr() on a mismatch. Called by emit_value(), parse_value() and
+ * skip_value().
+ */
 static void lit(P *p, const char *word)
 {
 	size_t l = strlen(word);
@@ -618,7 +710,10 @@ static void lit(P *p, const char *word)
 	p->i += l;
 }
 
-/* length of the number at s[0..n), or where it goes wrong and *bad why */
+/*
+ * Length of the number at s[0..n), or the position of the first bad byte
+ * with *bad set to why. Called by scan_number().
+ */
 static INLINE size_t num_len(const char *s, size_t n, const char **bad)
 {
 #define C(k) ((k) < n ? (unsigned char)s[k] : -1)
@@ -647,7 +742,11 @@ static INLINE size_t num_len(const char *s, size_t n, const char **bad)
 #undef C
 }
 
-/* length of the number at i; one that runs into the window's end rescans */
+/*
+ * num_len() at i, rescanning after more() when the number reaches the end of
+ * the window; perr_at() on a bad number. Called by emit_value(),
+ * parse_value() and skip_value().
+ */
 static INLINE size_t scan_number(P *p)
 {
 	const char *bad;
@@ -661,6 +760,10 @@ static INLINE size_t scan_number(P *p)
 	return k;
 }
 
+/*
+ * Parse the four hex digits of a \u escape into *out; 0 if fewer than four
+ * or not hex.
+ */
 static int hex4(const char *s, size_t n, unsigned *out)
 {
 	unsigned v = 0;
@@ -681,7 +784,10 @@ static int hex4(const char *s, size_t n, unsigned *out)
 	return 1;
 }
 
-/* length of the valid UTF-8 sequence at s[0..n), or 0 if invalid */
+/*
+ * Length of the valid UTF-8 sequence at s[0..n), or 0 if invalid (overlong,
+ * surrogate, above U+10FFFF, truncated).
+ */
 static size_t utf8_check(const char *s, size_t n)
 {
 	unsigned char a = (unsigned char)s[0], b, c, d;
@@ -708,7 +814,7 @@ static size_t utf8_check(const char *s, size_t n)
 	return c >= 0x80 && c <= 0xBF && d >= 0x80 && d <= 0xBF ? 4 : 0;
 }
 
-/* decode the code point at already-valid UTF-8 s[0..n) */
+/* Decode the code point at s[0..n), which utf8_check() has accepted. */
 static size_t utf8_get(const char *s, size_t n, unsigned *cp)
 {
 	unsigned char a = (unsigned char)s[0];
@@ -723,6 +829,7 @@ static size_t utf8_get(const char *s, size_t n, unsigned *cp)
 	return w;
 }
 
+/* Encode cp as UTF-8 at d and return its length. */
 static size_t utf8_put(char *d, unsigned cp)
 {
 	if (cp < 0x80) {
@@ -747,7 +854,12 @@ static size_t utf8_put(char *d, unsigned cp)
 	return 4;
 }
 
-/* str_end's rare cases, out of line so str_end inlines; a refill re-bases end */
+/*
+ * str_end()'s rare cases, kept out of line so str_end() inlines: refill with
+ * avail(), then step over an escape, or check a control byte or UTF-8 with
+ * utf8_check(). Returns end re-based to the moved window. Called by
+ * str_end().
+ */
 static COLD size_t str_slow(P *p, size_t end, int *esc)
 {
 	size_t k = end - p->i, m = avail(p, k + 4), w;	/* escape, UTF-8 */
@@ -769,7 +881,11 @@ static COLD size_t str_slow(P *p, size_t end, int *esc)
 	return end + w;
 }
 
-/* index of the closing quote, *esc if escaped; i stays on the opening one */
+/*
+ * Index of the closing quote of the string at i, found with scan_str() and
+ * str_slow(); *esc is set if the string has a backslash. i stays on the
+ * opening quote. Called by emit_string(), parse_string() and skip_string().
+ */
 static INLINE size_t str_end(P *p, int *esc)
 {
 	size_t end = p->i + 1;
@@ -783,7 +899,11 @@ static INLINE size_t str_end(P *p, int *esc)
 	}
 }
 
-/* decode the escape whose backslash precedes s[*j]; *j moves past it */
+/*
+ * Decode the escape whose backslash precedes s[*j], moving *j past it. \u
+ * joins surrogate pairs; a lone surrogate becomes U+FFFD. Called by
+ * emit_string(), parse_string() and skip_string().
+ */
 static unsigned unescape(P *p, size_t *j)
 {
 	const char *s = p->s + *j;
@@ -822,7 +942,10 @@ static unsigned unescape(P *p, size_t *j)
 static char   obuf[1u << 16];
 static size_t olen;
 
-/* a reader that stops early (json ... | head) is not an error worth a word */
+/*
+ * After a failed write: exit(1) quietly if os_out_closed(), as when piped to
+ * head; otherwise die() with the error. Called by oflush() and om_slow().
+ */
 static NORETURN void werr(void)
 {
 	if (os_out_closed())
@@ -830,6 +953,11 @@ static NORETURN void werr(void)
 	die("write error: %s", strerror(errno));
 }
 
+/*
+ * fwrite() obuf and fflush() stdout; werr() on failure. more() calls it so
+ * output appears before a blocking read. Called by main(), more(), oc() and
+ * om_slow().
+ */
 static void oflush(void)
 {
 	if (olen && fwrite(obuf, 1, olen, stdout) != olen)
@@ -839,7 +967,10 @@ static void oflush(void)
 		werr();
 }
 
-/* om's rare case, out of line so om inlines */
+/*
+ * om() when obuf is full, kept out of line so om() inlines: oflush(), then
+ * copy into obuf, or fwrite() directly if n exceeds it. Called by om().
+ */
 static COLD void om_slow(const char *s, size_t n)
 {
 	oflush();
@@ -852,6 +983,10 @@ static COLD void om_slow(const char *s, size_t n)
 	olen = n;
 }
 
+/*
+ * Append n bytes to obuf, the 64 KiB output buffer; om_slow() when it would
+ * overflow.
+ */
 static INLINE void om(const char *s, size_t n)
 {
 	if (olen + n > sizeof obuf) {
@@ -862,6 +997,7 @@ static INLINE void om(const char *s, size_t n)
 	olen += n;
 }
 
+/* om() for one byte. */
 static void oc(char c)
 {
 	if (olen == sizeof obuf)
@@ -869,8 +1005,13 @@ static void oc(char c)
 	obuf[olen++] = c;
 }
 
+/*
+ * om() for a C string. With a literal, strlen() is a constant and om() stays
+ * inlined.
+ */
 static INLINE void os_(const char *s) { om(s, strlen(s)); }
 
+/* Write 2 * lvl spaces with om(), copied from a 64-byte run of spaces. */
 static void indent(int lvl)
 {
 	static char sp[64];
@@ -883,6 +1024,10 @@ static void indent(int lvl)
 	om(sp, (size_t)n);
 }
 
+/*
+ * Write byte c as jq does: \" \\ \b \f \n \r \t, other control bytes as
+ * \u00XX, anything else unchanged.
+ */
 static void oesc(unsigned char c)
 {
 	static const char hex[] = "0123456789abcdef";
@@ -905,6 +1050,11 @@ static void oesc(unsigned char c)
 	oc((char)c);
 }
 
+/*
+ * Write a decoded string in quotes: om() for runs that need no escape,
+ * oesc() for each byte that does. emit_string() does the same from raw
+ * input. Called by print_val().
+ */
 static void print_str(const char *s, size_t len)
 {
 	size_t i = 0, run;
@@ -921,6 +1071,11 @@ static void print_str(const char *s, size_t len)
 	oc('"');
 }
 
+/*
+ * Decode the string at i into the arena. str_end() finds the end; an escape-
+ * free string is one memcpy() (+18%), others go through unescape() and
+ * utf8_put(). Called by parse_container(), parse_value() and skey().
+ */
 static jstr parse_string(P *p)
 {
 	int esc;
@@ -957,6 +1112,11 @@ static jstr  *stk_k;
 static jval **stk_v;
 static size_t stk_n, stk_cap;
 
+/*
+ * Parse an array or object. Children collect on stk_k and stk_v; when it
+ * closes, arena_grow() copies them out once, at exact size. Called by
+ * parse_value().
+ */
 static jval *parse_container(P *p)
 {
 	char open = p->s[p->i], close = open == '[' ? ']' : '}';
@@ -999,6 +1159,11 @@ static jval *parse_container(P *p)
 	return v;
 }
 
+/*
+ * Build a jval tree of the value at i. A number keeps its lexeme, copied
+ * into the arena when the window can move. Called by main(),
+ * parse_container(), sfilter() and sstep().
+ */
 static jval *parse_value(P *p)
 {
 	jval *v;
@@ -1020,7 +1185,7 @@ static jval *parse_value(P *p)
 		len = scan_number(p);
 		v = newval(J_NUM);
 		v->u.num.p = p->s + p->i;
-		if (p->windowed)		/* the lexeme, not the window */
+		if (p->windowed)		/* more() moves the window: copy */
 			v->u.num.p = arena_grow(p->s + p->i, len, len, 1);
 		v->u.num.len = len;
 		p->i += len;
@@ -1029,6 +1194,10 @@ static jval *parse_value(P *p)
 	return v;
 }
 
+/*
+ * Write a tree in jq's format. emit_value() writes the same bytes straight
+ * from the input. Called by print_sink().
+ */
 static void print_val(const jval *v, int lvl)
 {
 	size_t i, n;
@@ -1062,9 +1231,13 @@ static void print_val(const jval *v, int lvl)
 	oc(v->t == J_ARR ? ']' : '}');
 }
 
-/* streaming path: no allocation, output byte-identical to print_val */
 static void emit_value(P *p, int lvl);
 
+/*
+ * parse_string() and print_str() in one pass: om() copies the runs between
+ * backslashes, and each unescape()d character goes out through oesc() or
+ * utf8_put(). Called by emit_container() and emit_value().
+ */
 static void emit_string(P *p)
 {
 	int esc;
@@ -1100,6 +1273,10 @@ static void emit_string(P *p)
 	p->i = end + 1;
 }
 
+/*
+ * parse_container() writing output in place of a tree. Called by
+ * emit_value().
+ */
 static void emit_container(P *p, int lvl)
 {
 	char open = p->s[p->i], close = open == '[' ? ']' : '}';
@@ -1138,6 +1315,10 @@ static void emit_container(P *p, int lvl)
 	oc(close);
 }
 
+/*
+ * parse_value() writing output in place of a tree: validates one value and
+ * reformats it. Called by emit_container(), main() and sstep().
+ */
 static void emit_value(P *p, int lvl)
 {
 	size_t len;
@@ -1162,7 +1343,11 @@ static void emit_value(P *p, int lvl)
 	p->depth--;
 }
 
-/* after a member: 1 past a ',', 0 past the closing bracket */
+/*
+ * After a member: 1 past a ',', 0 past the closing bracket, perr() for
+ * anything else. Called by sfilter(), sindex(), skey(), skip_container() and
+ * sstream().
+ */
 static int next_member(P *p, char close)
 {
 	skipws(p);
@@ -1171,9 +1356,12 @@ static int next_member(P *p, char close)
 	perr(p, close == ']' ? "expected ',' or ']'" : "expected ',' or '}'");
 }
 
-/* validate and step over a value: what a query does not select */
 static void skip_value(P *p);
 
+/*
+ * emit_string() with no output: str_end(), then unescape() on each escape to
+ * validate it. Called by skip_key() and skip_value().
+ */
 static void skip_string(P *p)
 {
 	int esc;
@@ -1190,7 +1378,10 @@ static void skip_string(P *p)
 	p->i = end + 1;
 }
 
-/* in an object, past a member's key and its ':' */
+/*
+ * skip_string() for an object member's key, then past its ':'. Called by
+ * sfilter(), skip_container() and sstream().
+ */
 static void skip_key(P *p)
 {
 	skip_string(p);
@@ -1200,6 +1391,7 @@ static void skip_key(P *p)
 	p->i++;
 }
 
+/* emit_container() with no output. Called by skip_value(). */
 static void skip_container(P *p)
 {
 	char open = p->s[p->i], close = open == '[' ? ']' : '}';
@@ -1217,6 +1409,10 @@ static void skip_container(P *p)
 	} while (next_member(p, close));
 }
 
+/*
+ * emit_value() with no output, for members a path passes over. Called by
+ * sindex(), skey() and skip_container().
+ */
 static void skip_value(P *p)
 {
 	size_t len;
@@ -1242,7 +1438,11 @@ static void skip_value(P *p)
 
 typedef void (*sink_fn)(const jval *v, void *ctx);
 
-/* ctx counts the values printed */
+/*
+ * The sink for results: a newline between them, then print_val(), or the raw
+ * bytes of a string under -r. *ctx counts results, so main() writes the
+ * final newline only after one. Called by main(), sfilter() and sstep().
+ */
 static void print_sink(const jval *v, void *ctx)
 {
 	int *n = ctx;
@@ -1262,7 +1462,10 @@ typedef struct {
 	int has_start, has_end, has_step;
 } jslice;
 
-/* optional signed integer; returns whether one was present */
+/*
+ * Parse an optional signed integer at *pp for a slice or index; 0 if there
+ * is none, die() on overflow. Called by parse_bracket() and sstep().
+ */
 static int slice_num(const char **pp, long long *out)
 {
 	const char *s = *pp;
@@ -1284,7 +1487,11 @@ static int slice_num(const char **pp, long long *out)
 	return 1;
 }
 
-/* how many of n elements a nonzero-step slice selects; the first in *first */
+/*
+ * How many of n elements a slice with a nonzero step selects, and the first
+ * in *first, clamped as Python clamps. Called by apply_union(), r_select()
+ * and slice_array().
+ */
 static long long slice_range(const jslice *sl, long long n, long long *first)
 {
 	long long step = sl->has_step ? sl->step : 1;
@@ -1306,6 +1513,11 @@ static long long slice_range(const jslice *sl, long long n, long long *first)
 	return start > end ? (start - end - 1) / -step + 1 : 0;
 }
 
+/*
+ * a[1:3]: a new array of the elements slice_range() selects; die() on step
+ * 0. r_select() is the --rfc9535 version, which sends each element to the
+ * sink. Called by apply_bracket().
+ */
 static jval *slice_array(const jval *a, const jslice *sl)
 {
 	long long step = sl->has_step ? sl->step : 1, start, cnt, k;
@@ -1321,7 +1533,10 @@ static jval *slice_array(const jval *a, const jslice *sl)
 	return out;
 }
 
-/* iterative, so many wildcards cannot exhaust the stack */
+/*
+ * Whether str matches pat, with '+' as fnmatch()'s '*'. Iterative, with one
+ * backtrack point. Called by apply_key() and desc_apply().
+ */
 static int glob_match(const char *pat, size_t pn, const char *str, size_t sn)
 {
 	size_t p = 0, s = 0, star = (size_t)-1, mark = 0;
@@ -1345,7 +1560,10 @@ static int glob_match(const char *pat, size_t pn, const char *str, size_t sn)
 	return p == pn;
 }
 
-/* an array index spelled as a key: a.0 */
+/*
+ * A dotted component as an array index (a.0); die() on a non-digit or
+ * overflow. Called by apply_key() and sstep().
+ */
 static size_t key_index(const char *q, size_t klen)
 {
 	size_t i, idx = 0;
@@ -1363,7 +1581,7 @@ static size_t key_index(const char *q, size_t klen)
 	return idx;
 }
 
-/* index of the first member named k, or the member count */
+/* Index of the first member of v named k, or v's member count. */
 static size_t member(const jval *v, const char *k, size_t klen)
 {
 	size_t i;
@@ -1374,6 +1592,10 @@ static size_t member(const jval *v, const char *k, size_t klen)
 	return i;
 }
 
+/*
+ * One dotted component on a tree: a key, a '+' glob giving an object, or an
+ * array index; die() on a miss. Called by walk().
+ */
 static const jval *apply_key(const jval *v, const char *q, size_t klen)
 {
 	int glob = memchr(q, '+', klen) != NULL;
@@ -1404,6 +1626,7 @@ static const jval *apply_key(const jval *v, const char *q, size_t klen)
 	return v->u.c.v[idx];
 }
 
+/* JSON whitespace: space, tab, \n and \r, for whitespace inside brackets. */
 static int isblank_(int c)
 {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r';
@@ -1418,7 +1641,10 @@ typedef struct {
 	jstr name;
 } bsel;
 
-/* the selectors in [a,b,...]; *pp points past '[' and is left past ']' */
+/*
+ * The selectors in [a,b,...]. *pp points past '[' and is left past ']'.
+ * Called by apply_bracket(), descend() and sstep().
+ */
 static size_t parse_bracket(const char **pp, const char *path, bsel **out)
 {
 	const char *b = *pp;
@@ -1463,6 +1689,10 @@ static size_t parse_bracket(const char **pp, const char *path, bsel **out)
 	return n;
 }
 
+/*
+ * push() member j of v into a union's result once; taken[] marks it. Called
+ * by apply_union().
+ */
 static void take(jval *out, const jval *v, char *taken, size_t j)
 {
 	if (!taken[j]) {
@@ -1471,7 +1701,10 @@ static void take(jval *out, const jval *v, char *taken, size_t j)
 	}
 }
 
-/* [a,b,...]: one sub-array or sub-object, each member once, as asked */
+/*
+ * [a,b,...] on a tree: one sub-array or sub-object, each member once, in the
+ * order asked. Called by apply_bracket().
+ */
 static jval *apply_union(const jval *v, const bsel *sel, size_t n)
 {
 	size_t i, m;
@@ -1511,7 +1744,11 @@ static jval *apply_union(const jval *v, const bsel *sel, size_t n)
 	return out;
 }
 
-/* *pp points past '['; leaves it past ']' */
+/*
+ * One bracket on a tree: a name, an index, slice_array(), or apply_union()
+ * for several selectors. *pp points past '[' and is left past ']'. Called by
+ * walk().
+ */
 static const jval *apply_bracket(const jval *v, const char **pp,
 				 const char *path)
 {
@@ -1541,17 +1778,20 @@ static const jval *apply_bracket(const jval *v, const char **pp,
 }
 
 /*
- * [?expr] is RFC 9535's filter, compiled and evaluated by the --rfc9535 code
- * below, so it has RFC semantics: a missing member is false, not an error.
- * It streams the matching elements or member values, like [@]. doc_root is what $ means; a
- * path whose filters use $ is answered from a tree of the whole document.
+ * [?expr] is RFC 9535's filter: path_filter() compiles it and x_true()
+ * evaluates it, so a missing member makes the test false. It streams the
+ * matching elements or member values, as [@] does. doc_root is the value of
+ * $; a path whose filters use $ runs on a tree of the whole document.
  */
 typedef struct rexp rexp;
 static rexp *path_filter(const char *q, const char **end);
 static int x_true(const rexp *e, const jval *cur, const jval *root);
 static const jval *doc_root;
 
-/* past the quoted name at s, escapes and all; at the NUL if unterminated */
+/*
+ * Past the quoted name at s, escapes included; at the NUL if it is
+ * unterminated. Called by bracket_end() and path_uses_root().
+ */
 static const char *skip_quoted(const char *s)
 {
 	char quote = *s++;
@@ -1562,8 +1802,10 @@ static const char *skip_quoted(const char *s)
 }
 
 /*
- * the ']' closing the '[' at s. Filters and quoted names are skipped whole,
- * so a ']' in either is safe; a quote starts a name only after '[' or ','.
+ * The ']' closing the '[' at s. Filters are skipped with path_filter() and
+ * quoted names with skip_quoted(), so a ']' inside either is safe; a quote
+ * starts a name only after '[' or ','. Called by descend(), sstream() and
+ * walk().
  */
 static const char *bracket_end(const char *s, const char *path)
 {
@@ -1593,7 +1835,10 @@ static const char *bracket_end(const char *s, const char *path)
 	die("unclosed '[' in path '%s'", path);
 }
 
-/* past the '.' between components, but not a '..'; "a." and "a.." err */
+/*
+ * Step past the '.' between components, stopping at a '..'; die() on a
+ * trailing "a." or "a..". Called by descend(), sstep() and walk().
+ */
 static const char *next_comp(const char *q, const char *path)
 {
 	if (*q != '.')
@@ -1603,7 +1848,11 @@ static const char *next_comp(const char *q, const char *path)
 	return q[1] == '.' ? q : q + 1;
 }
 
-/* what [@inner]rest runs on each element: inner then rest */
+/*
+ * The path each element of [@inner]rest runs: inner and rest joined in the
+ * arena; die() on a trailing '.'. Called by descend(), filter_array(),
+ * sfilter(), sstream() and stream_array().
+ */
 static const char *stream_path(const char *inner, size_t ilen,
 			       const char *rest, const char *path)
 {
@@ -1622,6 +1871,10 @@ static const char *stream_path(const char *inner, size_t ilen,
 static void walk(const jval *v, const char *q, const char *path,
 		 sink_fn sink, void *ctx, int depth);
 
+/*
+ * users[@.name]: walk() .name on each element (or object value) of users.
+ * sstream() does the same while parsing. Called by walk().
+ */
 static void stream_array(const jval *v, const char *inner, size_t ilen,
 			 const char *rest, const char *path,
 			 sink_fn sink, void *ctx, int depth)
@@ -1641,6 +1894,10 @@ static void stream_array(const jval *v, const char *inner, size_t ilen,
 	}
 }
 
+/*
+ * stream_array() with a test: only elements x_true() accepts are walked.
+ * sfilter() is the same on the parse. Called by walk().
+ */
 static void filter_array(const jval *v, const char *q, const char *path,
 			 sink_fn sink, void *ctx, int depth)
 {
@@ -1672,9 +1929,10 @@ typedef struct {
 } dsel;
 
 /*
- * sel applied to v, then to each child, depth first: the order of RFC 9535
- * and of jq's .., where a node's own matches come before its children's.
- * It is a search, so a node without the key or index has none, not an error.
+ * The search behind '..': walk() each child of v that d selects, then
+ * recurse into each child. A node's own matches come before its children's,
+ * as in RFC 9535 and jq; a node lacking the key adds no result. Called by
+ * descend().
  */
 static void desc_apply(const jval *v, const dsel *d, const char *path,
 		       sink_fn sink, void *ctx, int depth)
@@ -1705,7 +1963,10 @@ static void desc_apply(const jval *v, const dsel *d, const char *path,
 		desc_apply(v->u.c.v[i], d, path, sink, ctx, depth);
 }
 
-/* q is past the '..' */
+/*
+ * '..' on a tree: parse the selector after it into a dsel, then
+ * desc_apply(). q points past the '..'. Called by walk().
+ */
 static void descend(const jval *v, const char *q, const char *path,
 		    sink_fn sink, void *ctx, int depth)
 {
@@ -1742,13 +2003,18 @@ static void descend(const jval *v, const char *q, const char *path,
 	desc_apply(v, &d, path, sink, ctx, depth);
 }
 
+/*
+ * Run a default-dialect path on a tree, passing each result to sink. Called
+ * by desc_apply(), filter_array(), main(), sfilter(), sstep() and
+ * stream_array().
+ */
 static void walk(const jval *v, const char *q, const char *path,
 		 sink_fn sink, void *ctx, int depth)
 {
 	if (depth > MAXDEPTH)
 		die("path nesting too deep");
 
-	if (*q == '.' && q[1] != '.')		/* a.b and .a.b, not ..a */
+	if (*q == '.' && q[1] != '.')		/* a.b and .a.b; ..a is a search */
 		q++;
 	while (*q) {
 		if (q[0] == '.' && q[1] == '.') {
@@ -1792,6 +2058,10 @@ static void walk(const jval *v, const char *q, const char *path,
  */
 static void sstep(P *p, const char *q, const char *path, int *nout, int depth);
 
+/*
+ * Drop a leading '.' and run sstep(); the entry to the parse-time walk.
+ * Called by main() and sstream().
+ */
 static void swalk(P *p, const char *q, const char *path, int *nout, int depth)
 {
 	if (depth > MAXDEPTH)
@@ -1799,6 +2069,10 @@ static void swalk(P *p, const char *q, const char *path, int *nout, int depth)
 	sstep(p, *q == '.' && q[1] != '.' ? q + 1 : q, path, nout, depth);
 }
 
+/*
+ * Step past a '[' or '{' on the parse, counting depth as parse_value() does.
+ * Called by sfilter(), sindex(), skey() and sstream().
+ */
 static void enter(P *p)
 {
 	if (++p->depth > MAXDEPTH)
@@ -1807,6 +2081,10 @@ static void enter(P *p)
 	skipws(p);
 }
 
+/*
+ * A key on the parse: sstep() into the first member named k, skip_value()
+ * the others; die() if there is none. Called by sstep().
+ */
 static void skey(P *p, const char *k, size_t klen, const char *rest,
 		 const char *path, int *nout, int depth)
 {
@@ -1836,6 +2114,10 @@ static void skey(P *p, const char *k, size_t klen, const char *rest,
 		die("no such key: %.*s", (int)klen, k);
 }
 
+/*
+ * skey() for an array: sstep() into element idx, skip_value() the others.
+ * Called by sstep().
+ */
 static void sindex(P *p, size_t idx, const char *rest,
 		   const char *path, int *nout, int depth)
 {
@@ -1855,6 +2137,11 @@ static void sindex(P *p, size_t idx, const char *rest,
 		die("index %zu out of range (total: %zu)", idx, n);
 }
 
+/*
+ * stream_array() on the parse: swalk() each element or value, restoring an
+ * arena mark after each, so memory is bounded by the largest element.
+ * Called by sstep().
+ */
 static void sstream(P *p, const char *q, const char *path, int *nout,
 		    int depth)
 {
@@ -1876,7 +2163,10 @@ static void sstream(P *p, const char *q, const char *path, int *nout,
 	p->depth--;
 }
 
-/* each element needs a tree for the filter to look at, but only one at once */
+/*
+ * filter_array() on the parse: parse_value() one element at a time, test it
+ * with x_true(), walk() it if it passes. Called by sstep().
+ */
 static void sfilter(P *p, const char *q, const char *path, int *nout,
 		    int depth)
 {
@@ -1903,6 +2193,12 @@ static void sfilter(P *p, const char *q, const char *path, int *nout,
 	p->depth--;
 }
 
+/*
+ * One path step on the parse: emit_value() at the end of the path, else
+ * sstream(), sfilter(), sindex() or skey(). Globs, slices, negative indexes,
+ * -r strings and errors go to walk() on parse_value(). Called by sindex(),
+ * skey() and swalk().
+ */
 static void sstep(P *p, const char *q, const char *path, int *nout, int depth)
 {
 	const char *b = q + 1;
@@ -2005,6 +2301,10 @@ typedef struct {
 	int path;		/* in a standard path: no match/search */
 } Q;
 
+/*
+ * die() for a bad query: in a default-dialect filter it quotes the rest of
+ * the path; under --rfc9535 it gives the offset.
+ */
 static NORETURN void qerr(Q *q, const char *msg)
 {
 	if (q->path)
@@ -2012,11 +2312,16 @@ static NORETURN void qerr(Q *q, const char *msg)
 	die("invalid query at offset %zu: %s", q->i, msg);
 }
 
+/*
+ * The query byte k ahead of i, or 0 past the end. rc() is the same for regex
+ * patterns.
+ */
 static int qc(Q *q, size_t k)
 {
 	return q->i + k < q->n ? (unsigned char)q->s[q->i + k] : 0;
 }
 
+/* Skip the whitespace RFC 9535 allows between tokens. */
 static void qws(Q *q)
 {
 	while (qc(q, 0) == ' ' || qc(q, 0) == '\t' || qc(q, 0) == '\n' ||
@@ -2024,6 +2329,7 @@ static void qws(Q *q)
 		q->i++;
 }
 
+/* ASCII letter test. */
 static int isalpha_(int c)
 {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
@@ -2031,7 +2337,10 @@ static int isalpha_(int c)
 
 #define IJSON_MAX 9007199254740991LL	/* 2^53 - 1: exact in a double */
 
-/* "0" / ["-"] DIGIT1 *DIGIT, in I-JSON range; 0 if there is none */
+/*
+ * An RFC 9535 integer: "0" or ["-"] DIGIT1 *DIGIT, within 2^53 - 1; 0 if
+ * there is none. Called by q_selector().
+ */
 static int q_int(Q *q, long long *out)
 {
 	int neg = qc(q, 0) == '-';
@@ -2052,7 +2361,11 @@ static int q_int(Q *q, long long *out)
 	return 1;
 }
 
-/* a quoted string, decoded */
+/*
+ * Decode a quoted string per RFC 9535: escapes, surrogate pairs, UTF-8
+ * checked; qerr() on any error. Called by path_quoted(), q_selector() and
+ * x_atom().
+ */
 static jstr q_string(Q *q)
 {
 	char quote = q->s[q->i++];
@@ -2122,7 +2435,10 @@ static jstr q_string(Q *q)
 	return out;
 }
 
-/* member-name-shorthand: ALPHA, '_', non-ASCII, and digits after the first */
+/*
+ * A member-name-shorthand (.name): ALPHA, '_', non-ASCII, and digits after
+ * the first. Called by q_segment().
+ */
 static jstr q_shorthand(Q *q)
 {
 	size_t start = q->i;
@@ -2152,6 +2468,7 @@ static jstr q_shorthand(Q *q)
 static rquery *q_query(Q *q, int abs);
 static rexp *x_or(Q *q);
 
+/* An expression node from arena_zalloc(). */
 static rexp *xnew(int op, int type, rexp *a, rexp *b)
 {
 	rexp *e = arena_zalloc(sizeof *e);
@@ -2163,6 +2480,10 @@ static rexp *xnew(int op, int type, rexp *a, rexp *b)
 	return e;
 }
 
+/*
+ * One selector in a bracket: a name, '*', a filter, an index or a slice.
+ * Called by q_segment().
+ */
 static rsel q_selector(Q *q)
 {
 	rsel s;
@@ -2210,6 +2531,10 @@ static rsel q_selector(Q *q)
 	return s;
 }
 
+/*
+ * One segment: .name, .*, ..name, or a bracket of q_selector()s. Called by
+ * q_query().
+ */
 static rseg q_segment(Q *q)
 {
 	rseg g;
@@ -2252,6 +2577,10 @@ static rseg q_segment(Q *q)
 	return g;
 }
 
+/*
+ * A $ or @ query: q_segment() while a '.' or '[' follows. Counts depth, as
+ * filters recurse into it. Called by rfc_parse() and x_atom().
+ */
 static rquery *q_query(Q *q, int abs)
 {
 	rquery *r = arena_zalloc(sizeof *r);
@@ -2279,7 +2608,10 @@ static rquery *q_query(Q *q, int abs)
 	return r;
 }
 
-/* at most one node: no '..', and one name or index per segment */
+/*
+ * Whether r selects at most one node: no '..', and one name or index per
+ * segment. Called by comparable().
+ */
 static int singular(const rquery *r)
 {
 	size_t i;
@@ -2291,12 +2623,21 @@ static int singular(const rquery *r)
 	return 1;
 }
 
+/*
+ * Whether e may be an operand of == or <: a literal, a value function, or a
+ * singular() query (RFC 9535 well-typedness). Called by x_basic() and
+ * x_func().
+ */
 static int comparable(const rexp *e)
 {
 	return e->op == X_LIT || (e->op == X_FN && e->type == T_VALUE) ||
 	       (e->op == X_QUERY && singular(e->q));
 }
 
+/*
+ * Whether e may stand alone as a test: a query (true if it selects
+ * anything), or match() or search(). Called by x_basic().
+ */
 static int testable(const rexp *e)
 {
 	return e->op == X_QUERY || (e->op == X_FN && e->type != T_VALUE);
@@ -2306,6 +2647,11 @@ static const rre *re_compile(const char *s, size_t n);
 
 static rexp *x_atom(Q *q);
 
+/*
+ * A function call: check each argument against the function's signature, and
+ * re_compile() a literal pattern once; qerr() for match() and search() in
+ * the default dialect. Called by x_atom().
+ */
 static rexp *x_func(Q *q, const char *name, size_t len)
 {
 	static const struct { const char *name; int fn, type, a, b; } fns[] = {
@@ -2356,7 +2702,10 @@ static rexp *x_func(Q *q, const char *name, size_t len)
 	return e;
 }
 
-/* number = (int / "-0") [ "." 1*DIGIT ] [ "e" [ "-" / "+" ] 1*DIGIT ] */
+/*
+ * A number literal per RFC 9535's grammar, kept as its lexeme for numcmp().
+ * Called by x_atom().
+ */
 static jval *q_number(Q *q)
 {
 	size_t k = qc(q, 0) == '-' ? 1 : 0, start = q->i;
@@ -2390,7 +2739,10 @@ static jval *q_number(Q *q)
 	return v;
 }
 
-/* a literal, a query or a function call */
+/*
+ * A query, a string, a number, true, false, null, or a function call. Called
+ * by x_basic() and x_func().
+ */
 static rexp *x_atom(Q *q)
 {
 	int c = qc(q, 0);
@@ -2433,6 +2785,7 @@ static rexp *x_atom(Q *q)
 	return e;
 }
 
+/* A parenthesised expression. Called by x_basic(). */
 static rexp *x_paren(Q *q)
 {
 	rexp *e;
@@ -2447,6 +2800,10 @@ static rexp *x_paren(Q *q)
 	return e;
 }
 
+/*
+ * '!', a parenthesised expression, or x_atom() with an optional comparison;
+ * operands are checked with comparable() and testable(). Called by x_and().
+ */
 static rexp *x_basic(Q *q)
 {
 	static const struct { const char *op; int x; } ops[] = {
@@ -2488,6 +2845,10 @@ static rexp *x_basic(Q *q)
 	return xnew(ops[i].x, T_LOGICAL, e, r);
 }
 
+/*
+ * x_basic() joined by &&; below x_or(), so && binds tighter than ||. Called
+ * by x_or().
+ */
 static rexp *x_and(Q *q)
 {
 	rexp *e = x_basic(q);
@@ -2506,6 +2867,10 @@ static rexp *x_and(Q *q)
 	}
 }
 
+/*
+ * A filter expression: x_and() joined by ||. Counts depth, as x_paren()
+ * recurses into it. Called by path_filter(), q_selector() and x_paren().
+ */
 static rexp *x_or(Q *q)
 {
 	rexp *e;
@@ -2529,6 +2894,10 @@ static rexp *x_or(Q *q)
 	return e;
 }
 
+/*
+ * Compile a --rfc9535 query with q_query(), before input() so a bad query
+ * fails at once. Called by main().
+ */
 static rquery *rfc_parse(const char *s)
 {
 	Q q;
@@ -2547,7 +2916,11 @@ static rquery *rfc_parse(const char *s)
 	return r;
 }
 
-/* the filter in "[?expr]..." at s; *end is past its ']' */
+/*
+ * Compile the filter in "[?expr]..." at s with x_or(), refusing match() and
+ * search(); *end is past its ']'. Called by bracket_end(), descend(),
+ * filter_array(), path_uses_root() and sfilter().
+ */
 static rexp *path_filter(const char *s, const char **end)
 {
 	Q q;
@@ -2567,7 +2940,10 @@ static rexp *path_filter(const char *s, const char **end)
 	return e;
 }
 
-/* a quoted name in a standard path's bracket, decoded; *s moves past it */
+/*
+ * A quoted name in a default-dialect bracket, decoded with q_string(); *s
+ * moves past it. Called by parse_bracket().
+ */
 static jstr path_quoted(const char **s)
 {
 	Q q;
@@ -2585,6 +2961,7 @@ static jstr path_quoted(const char **s)
 
 static int uses_root(const rexp *e);
 
+/* Whether query r uses $, as its root or in a filter. Called by uses_root(). */
 static int query_uses_root(const rquery *r)
 {
 	size_t i, j;
@@ -2599,13 +2976,21 @@ static int query_uses_root(const rquery *r)
 	return 0;
 }
 
+/*
+ * query_uses_root() over every query inside an expression. Called by
+ * path_uses_root() and query_uses_root().
+ */
 static int uses_root(const rexp *e)
 {
 	return e && ((e->op == X_QUERY && query_uses_root(e->q)) ||
 		     uses_root(e->a) || uses_root(e->b));
 }
 
-/* compile every filter in a path, before input: whether one uses $ */
+/*
+ * Compile every filter in a default-dialect path with path_filter() before
+ * input is read; 1 if any uses $, so main() builds a tree of the whole
+ * document. Called by main().
+ */
 static int path_uses_root(const char *q)
 {
 	int root = 0, name = 0;
@@ -2634,6 +3019,10 @@ typedef struct {
 	int neg;
 } rdec;
 
+/*
+ * Split a number lexeme into significant digits and a decimal exponent,
+ * dropping leading and trailing zeros. Called by numcmp().
+ */
 static void dec_split(const char *s, size_t len, rdec *x)
 {
 	const char *end = s + len, *t;
@@ -2675,11 +3064,19 @@ static void dec_split(const char *s, size_t len, rdec *x)
 			x->n[0]--;
 }
 
+/*
+ * Digit k of an rdec, across its integer and fraction parts. Called by
+ * numcmp().
+ */
 static int dec_digit(const rdec *x, size_t k)
 {
 	return k < x->n[0] ? x->d[0][k] : x->d[1][k - x->n[0]];
 }
 
+/*
+ * Compare two number lexemes as exact decimals: <0, 0 or >0. 2.50 equals
+ * 2.5, and 1e309 is less than 2e309. Called by jeq() and jlt().
+ */
 static int numcmp(const jval *a, const jval *b)
 {
 	rdec x, y;
@@ -2703,6 +3100,11 @@ static int numcmp(const jval *a, const jval *b)
 	return sx * r;
 }
 
+/*
+ * RFC 9535 ==: numbers by numcmp(), strings by bytes, containers deeply,
+ * object keys in any order. NULL is Nothing and equals only NULL. Called by
+ * x_true().
+ */
 static int jeq(const jval *a, const jval *b)
 {
 	size_t i, j;
@@ -2741,7 +3143,10 @@ static int jeq(const jval *a, const jval *b)
 	}
 }
 
-/* numbers by value, strings by code point (UTF-8 byte order is the same) */
+/*
+ * RFC 9535 <: numbers by numcmp(), strings by code point (the same as UTF-8
+ * byte order); 0 for any other pair. Called by x_true().
+ */
 static int jlt(const jval *a, const jval *b)
 {
 	size_t n;
@@ -2762,6 +3167,11 @@ static void r_apply(const rquery *r, size_t si, const jval *v,
 		    const jval *root, sink_fn sink, void *ctx);
 static int x_true(const rexp *e, const jval *cur, const jval *root);
 
+/*
+ * Apply one selector to v and r_apply() the next segment to each match. A
+ * filter runs x_true() inside an arena mark. Called by r_apply() and
+ * r_desc().
+ */
 static void r_select(const rquery *r, size_t si, const rsel *s,
 		     const jval *v, const jval *root, sink_fn sink, void *ctx)
 {
@@ -2809,7 +3219,10 @@ static void r_select(const rquery *r, size_t si, const rsel *s,
 	}
 }
 
-/* .. applies the segment to v, then to its descendants in document order */
+/*
+ * '..': r_select() the segment on v, then on each descendant in document
+ * order. Called by r_apply().
+ */
 static void r_desc(const rquery *r, size_t si, const jval *v,
 		   const jval *root, sink_fn sink, void *ctx)
 {
@@ -2822,6 +3235,10 @@ static void r_desc(const rquery *r, size_t si, const jval *v,
 			r_desc(r, si, v->u.c.v[i], root, sink, ctx);
 }
 
+/*
+ * --rfc9535 evaluation: segment si on v, and the sink after the last; depth
+ * first, which is RFC order. Called by main(), r_select() and x_nodes().
+ */
 static void r_apply(const rquery *r, size_t si, const jval *v,
 		    const jval *root, sink_fn sink, void *ctx)
 {
@@ -2844,6 +3261,7 @@ typedef struct {
 	const jval *first;
 } rcount;
 
+/* A sink that counts nodes and keeps the first. Called by x_nodes(). */
 static void count_sink(const jval *v, void *ctx)
 {
 	rcount *c = ctx;
@@ -2852,6 +3270,10 @@ static void count_sink(const jval *v, void *ctx)
 		c->first = v;
 }
 
+/*
+ * r_apply() a filter's @ or $ query into count_sink(). Called by x_true()
+ * and x_value().
+ */
 static rcount x_nodes(const rquery *q, const jval *cur, const jval *root)
 {
 	rcount c = { 0, NULL };
@@ -2860,6 +3282,10 @@ static rcount x_nodes(const rquery *q, const jval *cur, const jval *root)
 	return c;
 }
 
+/*
+ * n as a number jval, its lexeme in the arena, for count() and length().
+ * Called by x_value().
+ */
 static const jval *num_val(size_t n)
 {
 	char buf[24];
@@ -2871,7 +3297,10 @@ static const jval *num_val(size_t n)
 	return v;
 }
 
-/* a ValueType result, NULL for Nothing */
+/*
+ * A value operand: a literal, a singular query, or count(), value() or
+ * length(); NULL is Nothing. Called by x_true().
+ */
 static const jval *x_value(const rexp *e, const jval *cur, const jval *root)
 {
 	const jval *v;
@@ -2906,6 +3335,11 @@ static const jval *x_value(const rexp *e, const jval *cur, const jval *root)
 
 static int re_run(const rre *re, const char *s, size_t n, int full);
 
+/*
+ * A filter on one node: &&, || and !, existence, match() and search()
+ * through re_run(), comparisons through jeq() and jlt(). Called by
+ * desc_apply(), filter_array(), r_select() and sfilter().
+ */
 static int x_true(const rexp *e, const jval *cur, const jval *root)
 {
 	const jval *a, *b;
@@ -2956,6 +3390,10 @@ enum ucat { U_Lu, U_Ll, U_Lt, U_Lm, U_Lo, U_Mn, U_Mc, U_Me, U_Nd, U_Nl,
 
 #define RE_MAX 100000			/* instructions, after {n,m} expands */
 
+/*
+ * cp's Unicode general category, by binary search of ucat_runs in unicat.h.
+ * Called by re_class().
+ */
 static int ucat_of(unsigned cp)
 {
 	size_t lo = 0, hi = sizeof ucat_runs / sizeof *ucat_runs;
@@ -3015,11 +3453,16 @@ typedef struct {
 
 #define ALLCATS 0x3FFFFFFFu
 
+/* qc() for regex patterns: the byte k ahead, or -1 past the end. */
 static int rc(RP *r, size_t k)
 {
 	return r->i + k < r->n ? (unsigned char)r->s[r->i + k] : -1;
 }
 
+/*
+ * Whether cp is in class k: its ranges, then its \p{..} and \P{..}
+ * categories, then [^...] negation. Called by re_run().
+ */
 static int re_class(const rclass *k, unsigned cp)
 {
 	size_t i;
@@ -3034,6 +3477,7 @@ static int re_class(const rclass *k, unsigned cp)
 	return in != k->neg;
 }
 
+/* Add lo..hi to class k. */
 static void rx_range(rclass *k, unsigned lo, unsigned hi)
 {
 	k->r = arena_grow(k->r, k->n, k->n + 1, sizeof *k->r);
@@ -3041,7 +3485,10 @@ static void rx_range(rclass *k, unsigned lo, unsigned hi)
 	k->r[k->n++].hi = hi;
 }
 
-/* \p{..} or \P{..} at the 'p'; 0 if malformed */
+/*
+ * \p{..} or \P{..} at the 'p', added to class k's categories; 0 if
+ * malformed. Called by rx_atom() and rx_bracket().
+ */
 static int rx_prop(RP *r, rclass *k)
 {
 	static const char names[] = "LuLlLtLmLoMnMcMeNdNlNoPcPdPsPePiPfPo"
@@ -3070,7 +3517,10 @@ static int rx_prop(RP *r, rclass *k)
 	return 1;
 }
 
-/* SingleCharEsc after the backslash */
+/*
+ * A SingleCharEsc after the backslash, into *cp; 0 if c is not one. Called
+ * by rx_atom() and rx_ccchar().
+ */
 static int rx_single(int c, unsigned *cp)
 {
 	if (c == 'n' || c == 'r' || c == 't')
@@ -3082,12 +3532,16 @@ static int rx_single(int c, unsigned *cp)
 	return 1;
 }
 
+/* Read one pattern code point with utf8_get(). */
 static void rx_cp(RP *r, unsigned *cp)
 {
 	r->i += utf8_get(r->s + r->i, r->n - r->i, cp);
 }
 
-/* CCchar: anything but - [ \ ], or a SingleCharEsc */
+/*
+ * A CCchar inside [...]: any character but - [ \ ], or an rx_single()
+ * escape. Called by rx_bracket().
+ */
 static int rx_ccchar(RP *r, unsigned *cp)
 {
 	int c = rc(r, 0);
@@ -3104,6 +3558,7 @@ static int rx_ccchar(RP *r, unsigned *cp)
 	return 1;
 }
 
+/* A pattern tree node of type t. */
 static rnode *rx_new(char t)
 {
 	rnode *a = arena_zalloc(sizeof *a);
@@ -3112,6 +3567,10 @@ static rnode *rx_new(char t)
 	return a;
 }
 
+/*
+ * rx_new() for an empty class; ncats starts as every category. Called by
+ * rx_atom() and rx_bracket().
+ */
 static rnode *rx_klass(void)
 {
 	rnode *a = rx_new('k');
@@ -3121,7 +3580,10 @@ static rnode *rx_klass(void)
 	return a;
 }
 
-/* [...] after the '[' */
+/*
+ * [...] after the '[': ranges, \p{..} categories, and a leading ^. Called by
+ * rx_atom().
+ */
 static rnode *rx_bracket(RP *r)
 {
 	rnode *a = rx_klass();
@@ -3166,6 +3628,10 @@ static rnode *rx_bracket(RP *r)
 
 static rnode *rx_alt(RP *r);
 
+/*
+ * One atom: a character, '.', [...], an escape, \p{..}, a group, or ^ or $.
+ * NULL if invalid, which makes match() false. Called by rx_branch().
+ */
 static rnode *rx_atom(RP *r)
 {
 	int c = rc(r, 0);
@@ -3212,6 +3678,7 @@ static rnode *rx_atom(RP *r)
 	return a;
 }
 
+/* A decimal bound of {n,m}, saturating above RE_MAX. Called by rx_branch(). */
 static int rx_count(RP *r, long long *v)
 {
 	if (!isdig(rc(r, 0)))
@@ -3222,6 +3689,10 @@ static int rx_count(RP *r, long long *v)
 	return 1;
 }
 
+/*
+ * A sequence of rx_atom()s, each wrapped in a repeat node for *, +, ? or
+ * {n,m}. Called by rx_alt().
+ */
 static rnode *rx_branch(RP *r)
 {
 	rnode *seq = rx_new('&');
@@ -3269,6 +3740,7 @@ static rnode *rx_branch(RP *r)
 	}
 }
 
+/* rx_branch()es joined by '|'. Called by re_compile() and rx_atom(). */
 static rnode *rx_alt(RP *r)
 {
 	rnode *alt = rx_new('|'), *b;
@@ -3288,7 +3760,10 @@ static rnode *rx_alt(RP *r)
 	}
 }
 
-/* instructions a node compiles to, saturating past RE_MAX */
+/*
+ * How many instructions rx_emit() will produce for a, saturating past
+ * RE_MAX. Called by re_compile().
+ */
 static long long rx_size(const rnode *a)
 {
 	long long s = 0, k;
@@ -3310,6 +3785,10 @@ static long long rx_size(const rnode *a)
 	return s > RE_MAX ? RE_MAX + 1 : s;
 }
 
+/*
+ * Compile node a into Pike VM instructions at pc[at], expanding {n,m};
+ * returns the next free index. Called by re_compile().
+ */
 static int rx_emit(rinst *pc, int at, const rnode *a)
 {
 	size_t i;
@@ -3377,6 +3856,11 @@ static int rx_emit(rinst *pc, int at, const rnode *a)
 	return at;
 }
 
+/*
+ * Parse with rx_alt(), size with rx_size(), compile with rx_emit(). NULL if
+ * s is not I-Regexp; die() past RE_MAX instructions. Called by x_func() and
+ * x_true().
+ */
 static const rre *re_compile(const char *s, size_t n)
 {
 	RP r;
@@ -3402,8 +3886,8 @@ static const rre *re_compile(const char *s, size_t n)
 }
 
 /*
- * add pc and every state it reaches without input, at the start of s and/or
- * the end as given; 1 if one is the match
+ * Add pc and every state it reaches without input to list, taking ^ at the
+ * start and $ at the end; 1 if one of them is the match. Called by re_run().
  */
 static int re_add(const rre *re, int *list, int *n, unsigned *mark,
 		  unsigned gen, int *stk, int pc, int start, int end)
@@ -3428,7 +3912,10 @@ static int re_add(const rre *re, int *list, int *n, unsigned *mark,
 	return hit;
 }
 
-/* full: match() on all of s; else search() for a match anywhere */
+/*
+ * Run the Pike VM over s one code point at a time. full: match() on all of
+ * s; else search() for a match anywhere. Called by x_true().
+ */
 static int re_run(const rre *re, const char *s, size_t n, int full)
 {
 	size_t sz = (size_t)re->n, i = 0;
@@ -3459,6 +3946,7 @@ static int re_run(const rre *re, const char *s, size_t n, int full)
 	}
 }
 
+/* Print --help. Called by main(). */
 static void usage(void)
 {
 	puts("usage: json [options] [path]\n"
@@ -3480,6 +3968,11 @@ static void usage(void)
 "  --                 end of options");
 }
 
+/*
+ * Parse options and compile any query before input(). Then r_apply() for
+ * --rfc9535, walk() on a whole tree when a filter uses $, swalk() for a
+ * path, or emit_value() to reformat.
+ */
 int main(int argc, char **argv)
 {
 	const char *filter = NULL;

@@ -10,7 +10,8 @@ libc only, for macOS, Linux and Windows.
 - **Exact:** reformatted output is byte-identical to `jq .`, and numbers keep
   their original text, so `1.50` and `1e309` come back unchanged.
 - **Small memory:** piped input streams through a 64 KiB window, so
-  reformatting and per-element queries run in about 1.3 MB at any input size.
+  reformatting and per-element queries need memory for the largest element
+  at any input size: about 1.3 MB on a 15 MB file.
 - **Shell-friendly:** paths like `users.0.name` and `+` globs need no quoting.
 - **Standard when you want it:** `--rfc9535` takes RFC 9535 JSONPath queries
   and passes compliance tests.

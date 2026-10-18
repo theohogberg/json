@@ -22,8 +22,8 @@ The goals, in priority order:
 2. **Fast.** Reformatting is ~25x faster than jq 1.8.2 and queries 8–10x
    (`make bench`). Every change to a hot path is measured (see Benchmarks).
 3. **Bounded memory.** Piped input is processed in a sliding window, so
-   reformatting and per-element queries run in ~1.3 MB for any input
-   size.
+   reformatting and per-element queries use memory bounded by the largest
+   element, at any input size (~1.3 MB peak on a 15 MB file).
 4. **Shell-friendly.** The default query dialect avoids `$` and `*`, so
    dotted paths and `+` globs work unquoted in sh, bash and zsh. Brackets
    still need quotes in zsh (see DESIGN.md, section 1).
@@ -46,8 +46,9 @@ make DEPTH=256 test       # changed flags trigger a rebuild, checked at startup
 
 Run `make ci` before every commit; it must pass. A commit that changes only
 documentation (`*.md`) does not need it. Releases are tags named
-`v0.N`, N being the commit count (`git rev-list --count HEAD`); a new tag
-must come with an update to DESIGN.md (see its introduction). The current
+`v0.N`, N being the commit count (`git rev-list --count HEAD`). Make a tag
+only when a new design has been implemented in full, and update DESIGN.md
+with it (see its introduction). The current
 baseline is **109/109 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
 because their selector contains NUL), fuzz clean**.
 
@@ -130,8 +131,8 @@ middle of a token**:
   so `peek()` never needs to refill.
 
 `more()` flushes pending output before it blocks on a read, so results
-appear before EOF. Piped, any input reformats or answers `[@.name]` in
-~1.3 MB.
+appear before EOF. Piped, reformatting or answering `[@.name]` uses memory
+bounded by the largest element (~1.3 MB on a 15 MB file).
 
 ### Three evaluation paths
 
