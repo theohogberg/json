@@ -54,7 +54,7 @@ the makefile:
 
 - adds `.exe` to every output;
 - exports `PYTHONUTF8=1` so the test scripts write UTF-8;
-- sets `CC` to the first of gcc, clang and cl found on PATH;
+- sets `CC` to cl, or clang-cl if cl is not on PATH;
 - switches to MSVC flags (`-std:c11 -O2 -W4`) when `CC` is `cl` or
   `clang-cl`. `check` and `fuzz` then use MSVC's ASan, which has no UBSan.
 

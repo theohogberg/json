@@ -1,9 +1,7 @@
 /* json - format JSON from stdin, optionally selecting a value; see CLAUDE.md */
-/* POSIX or Windows (_WIN32: MSVC, MinGW, clang-cl); see os_read() */
+/* POSIX or Windows (_WIN32: MSVC, clang-cl); see os_read() */
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L		/* read(2) and fstat(2): libc, not C99 */
-#elif defined(__MINGW32__)
-#define __USE_MINGW_ANSI_STDIO 1	/* %zu and %lld in old msvcrt */
 #elif defined(_MSC_VER)
 #define _CRT_SECURE_NO_WARNINGS		/* C4996: strerror is C99, not unsafe */
 #endif
@@ -26,7 +24,7 @@
 #endif
 #ifdef _MSC_VER
 #include <intrin.h>
-#pragma comment(lib, "shell32")		/* CommandLineToArgvW; MinGW links it */
+#pragma comment(lib, "shell32")		/* CommandLineToArgvW */
 #endif
 
 #ifndef MAXDEPTH
