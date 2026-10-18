@@ -6,8 +6,8 @@ SEED   ?=
 CTS    = jsonpath-compliance-test-suite
 
 # Windows (MSYS2, MinGW and Git Bash all set OS): same targets, .exe outputs.
-# Recipes need a POSIX sh either way; CC defaults to the first of gcc, clang
-# and cl on PATH, so a Visual Studio developer prompt works as it is.
+# Recipes need a POSIX sh either way; CC defaults to cl, else clang-cl, so a
+# Visual Studio developer prompt works as it is. MinGW gcc is not supported.
 ifeq ($(OS),Windows_NT)
 # From cmd.exe, make falls back to cmd as its shell when no sh.exe is on PATH:
 # borrow Git for Windows' (git.exe in Git\cmd, sh.exe in Git\usr\bin), named
@@ -24,7 +24,7 @@ X      = .exe
 # the test scripts' Python would otherwise write cp1252
 export PYTHONUTF8 = 1
 ifeq ($(origin CC),default)
-CC    := $(or $(shell for c in gcc clang cl; do command -v $$c >/dev/null 2>&1 && echo $$c && break; done),gcc)
+CC    := $(or $(shell for c in cl clang-cl; do command -v $$c >/dev/null 2>&1 && echo $$c && break; done),cl)
 endif
 endif
 
