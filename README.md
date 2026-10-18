@@ -43,12 +43,13 @@ of *large* (19 KB).
 ```
 curl -s URL | json                       # reformat
 curl -s URL | json users.0.name          # select one value
-curl -s URL | json users.-1             # negative index, or 'users[-1]'
+curl -s URL | json users.-1              # negative index, or 'users[-1]'
 curl -s URL | json users.1:3             # slice (Python semantics), or 'users[1:3]'
 curl -s URL | json -r 'users[@.name]'    # one result per element, unquoted
 curl -s URL | json -r users.@.name       # the same, without brackets
 curl -s URL | json 'users[?@.age > 30]'  # filter
 curl -s URL | json ..id                  # search every depth
+curl -s URL | json '["10:10"]'           # a key that looks like a slice, -1 or @
 curl -s URL | json --rfc9535 '$.users[?@.age > 30].name'
 ```
 
