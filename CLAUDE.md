@@ -49,7 +49,7 @@ documentation (`*.md`) does not need it. Releases are tags named
 `v0.N`, N being the commit count (`git rev-list --count HEAD`). Make a tag
 only when a new design has been implemented in full, and update DESIGN.md
 with it (see its introduction). The current
-baseline is **125/125 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
+baseline is **132/132 tests, 283/283 conformance, 713/713 JSONPath compliance (2 skipped
 because their selector contains NUL), fuzz clean**.
 
 ### Windows
@@ -240,6 +240,7 @@ users.na+           glob object keys; '+' instead of '*'
 users[@.name]       stream: one result per element, or per object value
 users.@.name        the same stream without brackets, so zsh needs no quotes
 users[?@.age > 30]  filter: stream the elements (or values) that match
+users[?@.name ~ /^A/]  regex in a filter: searches; ^ and $ anchor
 ..id  a..name       search every depth: ..key, ..['k'], ..[n], ..[@], ..[?]
 ['a.b']  ["x y"]    quoted name: any key, including '.', '[' and '+'
 a[0:3,1]  o['x','y']  union: one sub-array or sub-object, each member once
@@ -293,13 +294,22 @@ error.
 parses and evaluates them (`path_filter`, `x_true`). Inside a filter, paths
 from `@` or `$` are JSONPath (`@.tags[0]`; the default form `@.tags.0` does
 not work there), and a missing member makes the test false instead of
-raising an error. `match()` and `search()` are refused in this dialect; the
-default dialect will get its own regex behaviour later. A filter streams
+raising an error. `match()` and `search()` are refused in this dialect;
+its regex is the `~` operator instead (below). A filter streams
 each matching element or object value through the rest of the path, as
 `[@]` does. `bracket_end` skips a filter as a whole, so a `"]"` inside one
 is safe. All filters compile before input is read. If a filter uses `$`,
 `main` builds a tree of the whole document; otherwise `sfilter()` builds a
 tree of one element at a time (1.4 MB piped on a 15 MB file).
+
+**`~` matches a string against a regex**: `@.name ~ /Ha/` is true if
+`Ha` occurs anywhere in the name, as in grep and awk; `^` and `$` anchor a
+full match (`/^Ken$/`). The pattern is I-Regexp, the engine behind
+`search()` (`x_tilde` compiles it once with `re_compile`), between slashes,
+with `\/` for a slash. A non-string value never matches. The left side
+must be a single value, and an invalid pattern fails before input is read.
+`~` exists only in the default dialect; `--rfc9535` rejects it. Matching
+belongs on values: filters do not glob keys (`@.na+`).
 
 **`[@]` and `[?]` accept arrays and objects.** On an object they see the
 values and drop the keys, so `users[@.name]` works whether `users` is a list
@@ -371,8 +381,6 @@ ambiguous.
 
 ## Not implemented
 
-- **Regex in default-dialect filters.** `match` and `search` exist only
-  under `--rfc9535`; the default dialect will get its own regex behaviour.
 - **Streaming `--rfc9535`.** It always builds the whole tree. A query such
   as `$.a[*].b`, with no `$` inside a filter, could stream the way `[@]`
   does.

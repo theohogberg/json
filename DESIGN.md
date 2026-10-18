@@ -15,7 +15,7 @@ benchmarks.
 
 Versions are tags named `v0.N`, where N is the number of commits up to the
 tagged one (`git rev-list --count`). The Status table and the "json now"
-column below are current as of `v0.33`. **Whenever a new tag is made, update
+column below are current as of `v0.36`. **Whenever a new tag is made, update
 this document:** bring the Status table and "json now" column up to date and
 change the version in this paragraph to the new tag.
 
@@ -24,7 +24,7 @@ change the version in this paragraph to the new tag.
 | proposal | section | status |
 |---|---|---|
 | Use RFC 9535 grammar and semantics for filters (`[?@.age > 30]`) | 1 | Done, in both dialects |
-| Defer `match`/`search` until a regex engine is worth its size | 1 | Reversed: implemented under `--rfc9535` as I-Regexp on a Pike VM; refused in the default dialect |
+| Defer `match`/`search` until a regex engine is worth its size | 1 | Reversed: implemented under `--rfc9535` as I-Regexp on a Pike VM; the default dialect refuses them and has `@.x ~ /re/` (a search; `^` and `$` anchor) on the same engine |
 | A `--rfc9535` mode that runs the compliance suite | 1 | Done: 713/713 |
 | Parse both dialects into one internal selector list | 1 | Not done: the default dialect has its own path parser, and only filters go through the RFC code |
 | Bracket-free spellings: `users.-1`, `users.1:3`, `users.@.name` | 1 | Done (`rebracket`): a component that is `-N` or `a:b:c` is always an index or slice, so keys such as `"-1"` need quotes (`['-1']`) |
@@ -68,7 +68,7 @@ The middle column is `json` at `v0.17`, when these measurements were taken.
 | slice step 0 | selects nothing | error, as in Python | unchanged; selects nothing under `--rfc9535` |
 | missing member | empty nodelist, success | error, exit 1 | unchanged; empty under `--rfc9535` and inside filters |
 | descendants | `..` | none | `..` |
-| filters | `[?@.x == 1]`, functions | not implemented | RFC 9535 filters; `match`/`search` only under `--rfc9535` |
+| filters | `[?@.x == 1]`, functions | not implemented | RFC 9535 filters, plus `~` regex in the default dialect; `match`/`search` only under `--rfc9535` |
 | member names | `['a b']`, `["a"]` | `a b` as one argument | `['a b']`, `["a"]` |
 
 ### Arguments for following RFC 9535

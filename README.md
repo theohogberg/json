@@ -34,6 +34,7 @@ of *large* (19 KB).
 | large | `json '[100:110]'` | 43.5 ms | 284 ms | 6.5x | 101 / 190 MB |
 | nested | `json 'items[@.user.login]'` | 13.3 ms | 111 ms | 8.4x | 12 / 55 MB |
 | nested | `json items.7000.comments` | 13.2 ms | 107 ms | 8.1x | 12 / 55 MB |
+| nested | `json '..[?@.login ~ /^dev4[0-9]$/]'` | 22.6 ms | 279 ms | 12.4x | 38 / 55 MB |
 
 `test/bench.py` generates the inputs and checks that the outputs match; run
 `make bench` to reproduce.
@@ -48,6 +49,7 @@ curl -s URL | json users.1:3             # slice (Python semantics), or 'users[1
 curl -s URL | json -r 'users[@.name]'    # one result per element, unquoted
 curl -s URL | json -r users.@.name       # the same, without brackets
 curl -s URL | json 'users[?@.age > 30]'  # filter
+curl -s URL | json 'users[?@.name ~ /^A/]'  # regex: searches, ^ and $ anchor
 curl -s URL | json ..id                  # search every depth
 curl -s URL | json '["10:10"]'           # a key that looks like a slice, -1 or @
 curl -s URL | json --rfc9535 '$.users[?@.age > 30].name'

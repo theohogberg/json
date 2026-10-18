@@ -27,6 +27,9 @@ CASES = [  # file, label, json args, jq args
     ("issues.json", "reformat", [], ["."]),
     ("issues.json", "a nested field per element", ["items[@.user.login]"], [".items[].user.login"]),
     ("issues.json", "deep select", ["items.7000.comments"], [".items[7000].comments"]),
+    ("issues.json", "search every depth, regex on a key's value",
+     ["..[?@.login ~ /^dev4[0-9]$/]"],
+     ['.. | objects | select((.login | type) == "string" and (.login | test("^dev4[0-9]$")))']),
     ("small.json", "reformat", [], ["."]),
 ]
 

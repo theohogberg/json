@@ -2801,6 +2801,39 @@ static rexp *x_paren(Q *q)
 }
 
 /*
+ * The default dialect's l ~ /pattern/: true if the pattern occurs anywhere in
+ * the string l, so ^ and $ anchor a full match. \/ is a '/' in the pattern.
+ * Compiled once by re_compile(), then run as search(). Called by x_basic().
+ */
+static rexp *x_tilde(Q *q, rexp *l)
+{
+	char *pat = arena_alloc(q->n - q->i + 1);
+	size_t n = 0;
+	rexp *e;
+
+	if (!comparable(l))
+		qerr(q, "only a single value matches a pattern");
+	if (qc(q, 0) != '/')
+		qerr(q, "expected a /pattern/ after '~'");
+	for (q->i++; qc(q, 0) != '/'; q->i++) {
+		if (q->i >= q->n)
+			qerr(q, "unterminated /pattern/");
+		if (qc(q, 0) == '\\' && qc(q, 1) == '/')
+			q->i++;
+		else if (qc(q, 0) == '\\' && qc(q, 1))
+			pat[n++] = q->s[q->i++];
+		pat[n++] = q->s[q->i];
+	}
+	q->i++;
+	e = xnew(X_FN, T_LOGICAL, l, NULL);
+	e->fn = F_SEARCH;
+	if (!(e->re = re_compile(pat, n)))
+		qerr(q, "invalid regular expression");
+	e->re_lit = 1;
+	return e;
+}
+
+/*
  * '!', a parenthesised expression, or x_atom() with an optional comparison;
  * operands are checked with comparable() and testable(). Called by x_and().
  */
@@ -2828,6 +2861,11 @@ static rexp *x_basic(Q *q)
 	e = x_atom(q);
 	save = q->i;
 	qws(q);
+	if (q->path && qc(q, 0) == '~') {
+		q->i++;
+		qws(q);
+		return x_tilde(q, e);
+	}
 	for (i = 0; i < sizeof ops / sizeof *ops; i++)
 		if (!strncmp(q->s + q->i, ops[i].op, strlen(ops[i].op)))
 			break;
@@ -4052,6 +4090,7 @@ static void usage(void)
 "  items[@.name]                            [@] streams elements or values\n"
 "  items.@.name                             the same, without brackets\n"
 "  items[?@.n > 1].name                     [?] streams those that match\n"
+"  items[?@.name ~ /^A/]                    ~ regex: searches; ^ $ anchor\n"
 "  ..id  a..name  ..[?@.x]                  .. searches every depth\n"
 "  ['a.b']  items[0,2]  o['x','y']          quoted names; unions, each once\n"
 "\n"
